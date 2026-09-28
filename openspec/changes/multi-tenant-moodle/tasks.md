@@ -63,7 +63,7 @@
 
 ## 3. Documentation
 
-- [ ] 3.1 Add an "Agregar un campus nuevo" section to `SKILL.md` documenting
+- [x] 3.1 Add an "Agregar un campus nuevo" section to `SKILL.md` documenting
       `agregar_campus` / `listar_campus` / `usar_campus` as the guided setup flow
       for a new tenant; verify by re-reading the section against the actual tool
       signatures implemented in section 2.
