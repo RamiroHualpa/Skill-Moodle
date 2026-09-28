@@ -18,6 +18,7 @@ Correr:  python server.py   (transport stdio: lo lanza el propio Claude Code)
 
 import asyncio
 import json
+import re
 import logging
 import os
 import unicodedata
@@ -292,6 +293,104 @@ async def usar_campus(tenant_id: str) -> dict:
     return {"ok": True, "activo": tenant_id}
 
 
+_RE_COMISION_GENERICA = re.compile(r"comisi[oó]n|^com[\s_.-]*\d|\bC\d{1,2}\b|^\d+pro(?:g)?\d+$", re.IGNORECASE)
+
+
+def _es_comision(nombre: str) -> bool:
+    """¿Este grupo es una comisión? Primero el criterio de TUP (`grupos.clasificar`:
+    «M25 C4-01»); si no, uno genérico por nombre — «Comision_6», «Comisión 3», «C2» — para
+    campus que nombran distinto. Los regionales (R-*) y los grupos auxiliares nunca cuentan."""
+    tipo = ws_api.clasificar_grupo(nombre or "")
+    if tipo == "comision":
+        return True
+    return tipo == "otro" and bool(_RE_COMISION_GENERICA.search(nombre or ""))
+
+
+async def _mapear_tenant(tenant_id: str) -> dict:
+    """Arma y guarda el "Mis datos" de un campus SIN preguntarle nada al tutor: sus
+    cursos (matrícula), SUS comisiones en cada uno (los grupos de los que es miembro,
+    `core_group_get_course_user_groups`; sólo los de tipo `comision`, no regionales ni
+    auxiliares) y las tareas de cada curso. Usa las credenciales YA guardadas del
+    tenant — si no hay, falla igual que cualquier tool (`_cli`).
+
+    Escribe en la carpeta del tenant PEDIDO (no del activo) y conserva la clave
+    "clickup" si ya había un `mis_datos.json`. No pisa nada si no se pudo descubrir
+    ningún curso. Devuelve `{"ok", "cursos", "comisiones", "aviso"?}`."""
+    cli = _cli(tenant_id)
+    cursos = await ws_api.descubrir_cursos(cli)
+    if not cursos or (isinstance(cursos[0], dict) and cursos[0].get("error")):
+        return {"ok": False, "error": (cursos[0].get("error") if cursos else "No veo ningún curso en tu cuenta.")}
+    uid = await cli.api.userid()
+    try:
+        info = await cli.ws("core_webservice_get_site_info")
+        nombre = (info or {}).get("fullname") or ""
+    except Exception:  # noqa: BLE001
+        nombre = ""
+
+    armados: list[dict] = []
+    for c in cursos:
+        cid = c.get("course_id")
+        try:
+            r = await cli.ws("core_group_get_course_user_groups", {"courseid": cid, "userid": uid})
+            grupos = (r or {}).get("groups", []) if isinstance(r, dict) else []
+        except Exception:  # noqa: BLE001
+            grupos = []
+        mias = [{"comision": g.get("name"), "group_id": g.get("id")}
+                for g in grupos if _es_comision(g.get("name") or "")]
+        acceso_total = False
+        if not grupos:
+            # Sin membresía en ningún grupo (docente/manager con acceso a todo el curso):
+            # las comisiones a su cargo son todas las del curso.
+            try:
+                todos = await cli.ws("core_group_get_course_groups", {"courseid": cid})
+            except Exception:  # noqa: BLE001
+                todos = []
+            mias = [{"comision": g.get("name"), "group_id": g.get("id")}
+                    for g in (todos or []) if _es_comision(g.get("name") or "")]
+            acceso_total = bool(mias)
+        try:
+            tareas = [{"assign_id": str(t["id"]), "titulo": t.get("titulo", "")}
+                      for t in await ws_api.listar_tareas(cli, cid)]
+        except Exception:  # noqa: BLE001
+            tareas = []
+        armados.append({"course_id": cid, "nombre": c.get("nombre"),
+                        "comisiones_del_tutor": mias, "tareas": tareas,
+                        **({"acceso_total": True} if acceso_total else {})})
+
+    # Sólo las materias donde el tutor tiene comisión; si en ninguna, todas (vacías).
+    con_comision = [a for a in armados if a["comisiones_del_tutor"]]
+    datos = {"tutor": {"nombre": nombre}, "cursos": con_comision or armados}
+
+    ruta = Path(almacen.mis_datos_path(tenant_id))
+    try:
+        previos = json.loads(ruta.read_text(encoding="utf-8"))
+        if isinstance(previos, dict) and "clickup" in previos:
+            datos["clickup"] = previos["clickup"]
+    except (OSError, ValueError):
+        pass
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    ruta.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    salida = {"ok": True, "cursos": len(datos["cursos"]),
+              "comisiones": sum(len(a["comisiones_del_tutor"]) for a in datos["cursos"])}
+    if any(a.get("acceso_total") for a in datos["cursos"]):
+        salida["nota"] = ("No figurás como miembro de ningún grupo en algunos cursos (tenés acceso "
+                          "docente a todo el curso): se listaron todas sus comisiones.")
+    if not con_comision:
+        salida["aviso"] = ("Estás matriculado en estos cursos pero no figurás en ningún grupo de "
+                           "tipo comisión: quedaron mapeados sin comisión asignada.")
+    return salida
+
+
+@mcp.tool()
+async def mapear_mis_datos() -> dict:
+    """Detecta SOLA, con las credenciales ya guardadas del campus ACTIVO, tus materias y
+    las comisiones que tenés asignadas (más las tareas de cada materia) y las guarda en
+    "Mis datos". No pide usuario ni contraseña ni nada: sirve para armar el mapeo la
+    primera vez o rehacerlo si cambió la cohorte. (API REST.)"""
+    return await _mapear_tenant(almacen.tenant_activo())
+
+
 @mcp.tool()
 async def agregar_campus(
     tenant_id: str,
@@ -367,7 +466,7 @@ async def agregar_campus(
             comisiones = [
                 {"comision": g.get("nombre"), "nombre_campus": g.get("nombre"),
                  "group_id": g.get("group_id")}
-                for g in grupos if g.get("tipo") == "comision"
+                for g in grupos if _es_comision(g.get("nombre") or "")
             ]
             materias_com.append({"materia": c.get("nombre"),
                                  "course_id": c.get("course_id"), "comisiones": comisiones})
@@ -383,7 +482,20 @@ async def agregar_campus(
                  f"catálogo ({type(e).__name__}: {str(e)[:150]}). Corré "
                  "descubrir_cursos/descubrir_comisiones a mano con usar_campus.")
 
+    # "Mis datos" del campus nuevo: sus materias y las comisiones que el tutor tiene
+    # asignadas, detectadas solas — así no arranca vacío ni hay que pedirle nada más.
+    mapeo = None
+    try:
+        mapeo = await _mapear_tenant(tenant_id)
+        if not mapeo.get("ok"):
+            aviso = ((aviso + " ") if aviso else "") + f"No pude mapear tus materias y comisiones: {mapeo.get('error')}"
+    except Exception as e:  # noqa: BLE001
+        aviso = ((aviso + " ") if aviso else "") + (
+            f"No pude mapear tus materias y comisiones ({type(e).__name__}). "
+            "Corré mapear_mis_datos con este campus activo.")
+
     salida = {"ok": True, "tenant_id": tenant_id, "cursos": len(res["cursos"]),
+              "comisiones_asignadas": (mapeo or {}).get("comisiones", 0),
               "mensaje": f"Campus '{tenant_id}' registrado y validado. "
                         f"Veo {len(res['cursos'])} cursos. Usá usar_campus('{tenant_id}') "
                         "para operar contra él."}
@@ -496,6 +608,16 @@ async def mis_datos() -> dict:
     curso puntual."""
     await almacen.init_db()
     datos = await almacen.get_mis_datos()
+
+    if not datos:
+        # Campus con credenciales guardadas pero sin mapeo (p. ej. dado de alta con una
+        # versión anterior): se detecta solo, sin pedirle nada al tutor.
+        try:
+            if _credenciales_de(almacen.tenant_activo()).get("MOODLE_USER"):
+                if (await _mapear_tenant(almacen.tenant_activo())).get("ok"):
+                    datos = await almacen.get_mis_datos()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Auto-mapeo de mis_datos falló: %s: %s", type(e).__name__, e)
 
     # Aviso de versión acá y no en una tool aparte: SKILL.md manda consultar `mis_datos`
     # primero, así que es el único lugar por el que todos los tutores pasan sí o sí. Va
