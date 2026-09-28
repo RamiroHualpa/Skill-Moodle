@@ -17,6 +17,14 @@ import sys
 import unittest
 from pathlib import Path
 
+# IMPORTANTE — orden de import: `server.py` corre `almacen.migrar_legacy_a_tup()` al
+# importarse (side-effect de módulo), y `almacen.HOME` se fija UNA SOLA VEZ al
+# importar. Sin fijar `MOODLE_SKILL_HOME` ANTES de este `import server`, la migración
+# automática corre contra el `~/.moodle-skill` REAL de quien corre los tests. Ver
+# tests/_env_setup.py para el detalle completo de por qué esto tiene que ser el
+# PRIMER import del archivo que pueda llegar a `almacen`/`server`.
+import _env_setup  # noqa: E402,F401
+
 RAIZ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAIZ / "mcp"))
 

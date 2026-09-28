@@ -626,12 +626,14 @@ def worksheet_md(inventario: dict, matriz: dict, links: list[dict], hallazgos: l
 
 async def auditar_aula(client, course_id: int, salidas_dir: str, materia: str = "",
                        evaluador: str = "", rol: str = "", con_navegador: bool = False,
-                       unidad: int | None = None) -> dict:
+                       unidad: int | None = None, tenant_id: str | None = None) -> dict:
     """Pipeline completo: relevar → testear links → matriz → hallazgos → (opcional) pase
     navegador → escribir el worksheet .md. READ-ONLY sobre Moodle. Con `con_navegador=True`
     suma el paso 2 (Playwright): cuenta preguntas de cuestionarios y clasifica las apps
     Google. Con `unidad=N` audita SOLO esa unidad (más rápido: testea solo sus links). Sin
-    `unidad`, el aula entera. Devuelve resumen + ruta del worksheet, o {error} si falla."""
+    `unidad`, el aula entera. `tenant_id` (opcional) scopea la sesión de navegador
+    (cookies/storage) a ese campus — sin él, cae al tenant activo de `almacen`. Devuelve
+    resumen + ruta del worksheet, o {error} si falla."""
     import os
 
     inv = await relevar_aula(client, course_id)
@@ -657,7 +659,7 @@ async def auditar_aula(client, course_id: int, salidas_dir: str, materia: str = 
         quizzes = quizzes_clasificados(inv)
         nav = await navegador.pase_navegador(
             base_url, getattr(client, "_dni", ""), getattr(client, "_password", ""),
-            quizzes, apps_google_urls(inv))
+            quizzes, apps_google_urls(inv), tenant_id=tenant_id)
         extra = hallazgos_navegador(quizzes, nav)
         if extra:
             orden = {"alta": 0, "media": 1, "baja": 2}

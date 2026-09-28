@@ -101,7 +101,10 @@ git). Si vas a usar Active-IA, pasale también ese usuario y contraseña. Listo:
 tocás variables de entorno.
 
 > El `.env` local tiene tu contraseña en texto: es tuyo, en tu máquina, con permisos
-> 600. No lo compartas ni lo subas a ningún lado.
+> 600 (Linux/macOS). No lo compartas ni lo subas a ningún lado. **En Windows**, `chmod
+> 600` sólo alterna el flag de sólo-lectura — no restringe qué otras cuentas de la
+> máquina pueden leerlo — así que la protección real ahí es que el archivo esté fuera
+> del repo y en tu carpeta de usuario.
 
 ## Actualizar la skill
 

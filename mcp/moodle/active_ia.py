@@ -34,7 +34,7 @@ from pathlib import Path
 import httpx
 
 from . import ws_api
-from .almacen import SALIDAS_DIR
+from . import almacen
 from .cliente import MobileWSClient
 
 # ---------- Constantes ----------
@@ -117,24 +117,62 @@ class ActiveIAClient:
             return resp
 
 
-# Singleton del módulo, configurado desde ENV VARS (no `config.py`, a diferencia del
-# copiloto). El default de la URL es el mismo que traía el copiloto en su config.
-def _default_client() -> ActiveIAClient:
+# Pool de clientes, UNO POR TENANT (igual que `_clientes` en server.py) — no un
+# singleton de módulo. Antes había un único `_client` global armado una vez desde
+# `os.environ`, así que `activeia_user`/`activeia_pass` pasados a `agregar_campus`
+# para un campus NUEVO quedaban silenciosamente ignorados: el singleton, ya creado
+# para el primer tenant, nunca se reconstruía al conmutar de campus. Ahora cada
+# tenant tiene su propio cliente, leído DIRECTO de su `.env` (vía `almacen.leer_env`,
+# nunca de `os.environ`) — mismo criterio que el cliente Moodle principal.
+_clients: dict[str, ActiveIAClient] = {}
+
+_ACTIVEIA_URL_DEFAULT = "https://api.active-ia.com/api/v1"
+
+
+def _default_client(tenant_id: str | None = None) -> ActiveIAClient:
+    tid = tenant_id or almacen.tenant_activo()
+    vals = almacen.leer_env(tid)
+    if (not almacen.tiene_env(tid) and tid == almacen.tenant_activo()
+            and almacen.os_environ_es_de(tid)):
+        # Legacy genuino: tutor que exportó ACTIVEIA_* a mano (sin pasar por
+        # `configurar`/`agregar_campus`, que las persisten en el `.env` del tenant) —
+        # `tid` no tiene NINGÚN `.env` propio todavía. Antes el gate era "le faltan
+        # las claves ACTIVEIA_*" (`vals.get(...)` vacío), así que un tenant con `.env`
+        # PROPIO pero sólo credenciales de Moodle (sin Active-IA) también entraba acá
+        # y se armaba con lo que hubiera en `os.environ` — que, tras un `usar_campus`,
+        # son las credenciales de Active-IA de OTRO tenant (el que estaba activo al
+        # arrancar el proceso). Confirmado por el reviewer: tup con Active-IA
+        # configurado, se agrega "otra" sin credenciales de Active-IA, se conmuta a
+        # "otra" con `usar_campus` y las llamadas de Active-IA salían con la cuenta de
+        # tup. Ahora sólo se mira `os.environ` si `tid` NO tiene `.env` en absoluto
+        # (`tiene_env`) Y `os.environ` no quedó marcado con el de otro tenant
+        # (`os_environ_es_de`) — un tenant con `.env` propio sin claves de Active-IA
+        # queda simplemente sin cliente configurado, igual que si nunca hubiera
+        # existido `os.environ`.
+        vals = {
+            "ACTIVEIA_URL": os.environ.get("ACTIVEIA_URL", ""),
+            "ACTIVEIA_USER": os.environ.get("ACTIVEIA_USER", ""),
+            "ACTIVEIA_PASS": os.environ.get("ACTIVEIA_PASS", ""),
+        }
     return ActiveIAClient(
-        base_url=os.environ.get("ACTIVEIA_URL", "https://api.active-ia.com/api/v1"),
-        username=os.environ.get("ACTIVEIA_USER", ""),
-        password=os.environ.get("ACTIVEIA_PASS", ""),
+        base_url=vals.get("ACTIVEIA_URL") or _ACTIVEIA_URL_DEFAULT,
+        username=vals.get("ACTIVEIA_USER", ""),
+        password=vals.get("ACTIVEIA_PASS", ""),
     )
 
 
-_client: ActiveIAClient | None = None
+def _get_client(tenant_id: str | None = None) -> ActiveIAClient:
+    tid = tenant_id or almacen.tenant_activo()
+    if tid not in _clients:
+        _clients[tid] = _default_client(tid)
+    return _clients[tid]
 
 
-def _get_client() -> ActiveIAClient:
-    global _client
-    if _client is None:
-        _client = _default_client()
-    return _client
+def invalidar_cliente(tenant_id: str) -> None:
+    """Descarta el cliente Active-IA cacheado de un tenant (para forzar recreación
+    con credenciales nuevas tras `configurar`/`agregar_campus`, o tras un cambio de
+    campus activo que traiga credenciales distintas)."""
+    _clients.pop(tenant_id, None)
 
 
 # ---------- FUNCIÓN 1: pendientes / mapa Moodle↔Active-IA ----------
@@ -644,12 +682,12 @@ async def exportar_devolucion_pdf(
 
     GET /documentos/correcciones/{correccion_id}/pdf con el JWT (mismo cliente que ya
     tiene el token cacheado) y guarda el archivo en `dest_dir`. Por default va al
-    `salidas/` de la Skill (`$MOODLE_SKILL_HOME/salidas`, = `almacen.SALIDAS_DIR`), el
-    mismo lugar donde `armar_informe` deja sus PDFs.
+    `salidas/` del tenant activo de la Skill (`almacen.salidas_dir()`), el mismo lugar
+    donde `armar_informe` deja sus PDFs.
 
     Devuelve `{ok, path, bytes}` con la ruta absoluta del PDF descargado, o `{error}`
     (nunca lanza)."""
-    destino = dest_dir or SALIDAS_DIR
+    destino = dest_dir or almacen.salidas_dir()
     try:
         resp = await cli_activeia.request(
             "GET", f"/documentos/correcciones/{correccion_id}/pdf", timeout=_PDF_TIMEOUT_S

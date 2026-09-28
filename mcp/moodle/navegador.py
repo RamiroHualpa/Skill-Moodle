@@ -15,8 +15,8 @@ re-loguear en cada corrida. Read-only: solo navega, nunca escribe en el campus.
 import os
 import re
 
-_AUTH_DIR = os.path.expanduser(os.environ.get("MOODLE_SKILL_HOME", "~/.moodle-skill"))
-_STORAGE = os.path.join(_AUTH_DIR, ".auth", "moodle-state.json")
+from . import almacen
+
 _RE_PREG_TXT = re.compile(r"(\d+)\s+preguntas?", re.I)
 # Señales de ACCESO DENEGADO en el render final. OJO: NO se incluye "iniciar sesión /
 # sign in / elegir cuenta" — Colab y otras apps muestran ese botón en su chrome aunque el
@@ -25,6 +25,12 @@ _RE_PREG_TXT = re.compile(r"(\d+)\s+preguntas?", re.I)
 _RE_LOGIN_WALL = re.compile(
     r"solicitar acceso|solicita acceso|pedir acceso|request access|necesitas acceso|"
     r"you need access|no ten[eé]s permiso|no tienes permiso|permission denied", re.I)
+
+
+def _storage_path(tenant_id: str | None = None) -> str:
+    """Ruta de la sesión persistida (storageState) de un tenant — scopeada por campus
+    para que las cookies de uno no se filtren a otro en la misma máquina."""
+    return os.path.join(almacen.tenant_dir(tenant_id), ".auth", "moodle-state.json")
 
 
 def disponible() -> bool:
@@ -92,18 +98,21 @@ async def _clasificar_app(page, url: str) -> str:
 
 
 async def pase_navegador(base: str, user: str, pw: str, quizzes: list[dict],
-                         apps: list[str], max_apps: int = 40) -> dict:
+                         apps: list[str], max_apps: int = 40,
+                         tenant_id: str | None = None) -> dict:
     """Corre el pase completo. `quizzes`: [{cmid, clase, nombre, unidad}] (clase = 'mini' |
-    'autoeval' | 'otro'). `apps`: URLs de NotebookLM/Colab a clasificar. Devuelve
-    {preguntas: {cmid: n|None}, apps: [{url, estado}], login_ok, aviso?}. No rompe: ante
-    cualquier fallo devuelve lo que alcanzó a juntar."""
+    'autoeval' | 'otro'). `apps`: URLs de NotebookLM/Colab a clasificar. `tenant_id`
+    (opcional) scopea la sesión persistida (storageState) a ese campus — sin él, cae
+    al tenant activo. Devuelve {preguntas: {cmid: n|None}, apps: [{url, estado}],
+    login_ok, aviso?}. No rompe: ante cualquier fallo devuelve lo que alcanzó a juntar."""
     if not disponible():
         return {"omitido": True, "aviso": "Playwright no está instalado: corré "
                 "`pip install playwright && playwright install chromium` para el pase "
                 "navegador. La auditoría por API ya corrió sin él."}
     from playwright.async_api import async_playwright
 
-    os.makedirs(os.path.dirname(_STORAGE), exist_ok=True)
+    storage = _storage_path(tenant_id)
+    os.makedirs(os.path.dirname(storage), exist_ok=True)
     preguntas: dict = {}
     apps_res: list = []
     login_ok = False
@@ -116,7 +125,7 @@ async def pase_navegador(base: str, user: str, pw: str, quizzes: list[dict],
             if not login_ok:
                 return {"login_ok": False, "aviso": "No pude loguear por navegador "
                         "(revisá usuario/contraseña). El pase navegador quedó sin correr."}
-            await ctx.storage_state(path=_STORAGE)  # sesión persistida para próximas corridas
+            await ctx.storage_state(path=storage)  # sesión persistida para próximas corridas
             for q in quizzes:
                 preguntas[q["cmid"]] = await _contar_preguntas(page, base, q["cmid"])
             for url in apps[:max_apps]:

@@ -306,6 +306,38 @@ Moodle") y ofrecele arrancar el Paso 0 ahí mismo, antes de seguir con ClickUp.
 
 Detalle completo de tools, catálogo y gotchas en `references/clickup-tareas.md`.
 
+## Paso 0-ter — Agregar un campus nuevo (opcional, multi-campus)
+
+Por defecto la skill opera contra UN solo campus (`tup`, TUP-UTN — es el que
+`configurar` deja armado en el Paso 0). Si el tutor necesita operar OTRO campus desde
+la misma instalación (otra UTN, otra sede), usá estas tres tools en vez de reinstalar
+la skill o pisar las credenciales que ya tiene:
+
+1. **`listar_campus()`** — muestra los campus registrados en esta máquina y cuál está
+   ACTIVO ahora mismo. Una instalación recién hecha siempre tiene al menos `tup`.
+2. **`agregar_campus(tenant_id, nombre, url, moodle_user, moodle_pass, activeia_user="",
+   activeia_pass="")`** — registra un campus nuevo SIN tocar el que ya está
+   configurado ni cambiar cuál está activo. `tenant_id` es un slug propio y único
+   (ej. `"tup"`, `"otra-utn"`); si ya existe, se rechaza sin persistir nada. Valida el
+   login contra `url` ANTES de guardar cualquier cosa — con credenciales inválidas no
+   queda ni `.env` ni entrada en `listar_campus`. Con login OK, guarda las
+   credenciales (permisos 600) y siembra el catálogo del campus nuevo corriendo
+   `descubrir_cursos`/`descubrir_comisiones` automáticamente.
+3. **`usar_campus(tenant_id)`** — cambia cuál campus opera TODAS las demás tools (hoy
+   ninguna pide un tenant explícito: siempre es "el activo"). Rechaza un `tenant_id`
+   no registrado sin tocar el activo — usá `listar_campus` primero si no estás
+   seguro del id exacto.
+
+Cada campus tiene sus propias credenciales, su propio `mis_datos`, su propio caché de
+snapshots/correcciones y su propio catálogo de aulas/comisiones — están completamente
+aislados entre sí (viven en `~/.moodle-skill/<tenant_id>/`). Conmutar con `usar_campus`
+nunca mezcla datos de un campus con los del otro.
+
+Una instalación que ya venía de antes de este multi-campus (con `.env`/`mis_datos.json`
+sueltos en `~/.moodle-skill/`) se migra SOLA la primera vez que arranca el MCP: esos
+datos pasan a `~/.moodle-skill/tup/` sin que el tutor haga nada, y los originales
+quedan intactos (nunca se borran).
+
 ## Las herramientas (qué pedir al MCP)
 
 | Querés… | Tool |

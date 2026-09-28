@@ -15,6 +15,11 @@ import sys
 import unittest
 from pathlib import Path
 
+# `moodle.active_ia` (importado más abajo) llega a `moodle.almacen`, cuyo `HOME` se
+# fija UNA SOLA VEZ al importar. Este import tiene que ir antes de ese, en todo
+# archivo que lo alcance. Ver tests/_env_setup.py para el detalle completo.
+import _env_setup  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
 
 from moodle.cliente import MoodleWSError  # noqa: E402
@@ -496,8 +501,9 @@ class TestErroresFrecuentes(unittest.TestCase):
         # porcentaje sobre 2 casos no significa nada.
         import tempfile
         from moodle import almacen as alm
-        prev_db = alm.DB_PATH
-        alm.DB_PATH = f"{tempfile.mkdtemp()}/chica.db"
+        prev_db_path = alm.db_path
+        db_temp = f"{tempfile.mkdtemp()}/chica.db"
+        alm.db_path = lambda tenant_id=None: db_temp
         try:
             self.correr(alm.init_db())
             for a in ("uno", "dos"):
@@ -511,7 +517,7 @@ class TestErroresFrecuentes(unittest.TestCase):
             self.assertEqual(r["temas"][0]["porcentaje"], 50)      # el % se calcula igual
             self.assertFalse(r["temas"][0]["sistemico"])           # pero NO concluye
         finally:
-            alm.DB_PATH = prev_db
+            alm.db_path = prev_db_path
 
     def test_el_porcentaje_es_sobre_los_CORREGIDOS_no_sobre_los_afectados(self):
         # Lo que importa no es "3 se equivocaron" sino "3 de 5": sin el denominador el
@@ -528,8 +534,9 @@ class TestErroresFrecuentes(unittest.TestCase):
         # se decide rehacer material de cátedra.
         import tempfile
         from moodle import almacen as alm
-        prev_db = alm.DB_PATH
-        alm.DB_PATH = f"{tempfile.mkdtemp()}/dedup.db"
+        prev_db_path = alm.db_path
+        db_temp = f"{tempfile.mkdtemp()}/dedup.db"
+        alm.db_path = lambda tenant_id=None: db_temp
         try:
             self.correr(alm.init_db())
             for _ in range(2):                     # cada alumno, cargado DOS veces
@@ -544,7 +551,7 @@ class TestErroresFrecuentes(unittest.TestCase):
             self.assertEqual(temas["tema-x"]["alumnos_afectados"], 1)   # 1 persona, no 2
             self.assertFalse(temas["tema-x"]["sistemico"])
         finally:
-            alm.DB_PATH = prev_db
+            alm.db_path = prev_db_path
 
 
 class TestEscala3(unittest.TestCase):
