@@ -193,5 +193,42 @@ class TestAislamientoEntreTenants(_ConHomeTemporal):
         self.assertIn(os.path.join("otra", ".auth"), p_otra)
 
 
+class TestMigracionAutomaticaAlImportar(unittest.TestCase):
+    """4.1 (mockeado, sin login real): en una máquina con instalación flat vieja, el
+    `import server` corre la migración solo, y una tool de lectura ve los mismos
+    datos que veía antes de este cambio — sin que el tutor haga nada."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env_previo = os.environ.get("MOODLE_SKILL_HOME")
+        os.environ["MOODLE_SKILL_HOME"] = self._tmp.name
+        # Sembrar el layout flat legacy ANTES de importar/recargar server, para que
+        # la migración automática al importar tenga algo que migrar.
+        home = Path(self._tmp.name)
+        (home / ".env").write_text("MOODLE_USER=viejo\nMOODLE_PASS=x\n", encoding="utf-8")
+        (home / "mis_datos.json").write_text(
+            json.dumps({"tutor": {"nombre": "Instalación vieja"}, "cursos": []}),
+            encoding="utf-8")
+
+    def tearDown(self):
+        if self._env_previo is None:
+            os.environ.pop("MOODLE_SKILL_HOME", None)
+        else:
+            os.environ["MOODLE_SKILL_HOME"] = self._env_previo
+        importlib.reload(almacen)
+        importlib.reload(server)
+        self._tmp.cleanup()
+
+    def test_import_migra_solo_y_mis_datos_lee_igual_que_antes(self):
+        importlib.reload(almacen)
+        importlib.reload(server)  # dispara almacen.migrar_legacy_a_tup() al importar
+
+        self.assertTrue((Path(self._tmp.name, "tup", ".env")).exists())
+        self.assertTrue((Path(self._tmp.name, ".env")).exists())  # original intacto
+
+        r = correr(server.mis_datos())
+        self.assertEqual(r["datos"]["tutor"]["nombre"], "Instalación vieja")
+
+
 if __name__ == "__main__":
     unittest.main()

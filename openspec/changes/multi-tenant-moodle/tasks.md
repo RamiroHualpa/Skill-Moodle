@@ -70,11 +70,11 @@
 
 ## 4. End-to-end verification
 
-- [ ] 4.1 On a machine with an existing flat single-tenant install, confirm the
+- [x] 4.1 On a machine with an existing flat single-tenant install, confirm the
       migration runs automatically and every previously-working tool call (at least
       one read tool and, if safe to test, `configurar`) behaves identically to
       before this change.
-- [ ] 4.2 Register a second tenant end to end via `agregar_campus`, switch to it
+- [x] 4.2 Register a second tenant end to end via `agregar_campus`, switch to it
       with `usar_campus`, run a read tool (e.g. `pendientes_por_corregir`) against
       it, switch back to `tup`, and confirm the second tenant's data never appeared
       while `tup` was active and vice versa (spec: per-tenant data isolation).
