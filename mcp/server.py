@@ -44,66 +44,156 @@ log = logging.getLogger("skill.server")
 mcp = FastMCP("moodle-tutor")
 
 _BASE_DEFAULT = "https://tup.sied.utn.edu.ar"
-# El .env vive junto a los datos locales (fuera del repo, nunca se versiona). Es la
-# forma amigable de configurar: el tutor le dice sus credenciales a Claude y la tool
-# `configurar` las escribe acá; no hace falta pelear con `export`.
-_ENV_PATH = Path(almacen.HOME) / ".env"
+
+# Migración automática (una vez, al importar): si esta máquina venía del layout flat
+# single-tenant (`~/.moodle-skill/.env` suelto), la copia a `~/.moodle-skill/tup/` sin
+# tocar los originales. No-op en instalaciones nuevas o ya migradas.
+almacen.migrar_legacy_a_tup()
 
 
-def _cargar_env() -> None:
-    """Puebla os.environ desde el .env local (KEY=valor por línea). El entorno real
-    gana sobre el .env (setdefault): quien ya exportó una var, la mantiene."""
-    if not _ENV_PATH.exists():
-        return
-    for linea in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+def _env_path(tenant_id: str | None = None) -> Path:
+    """.env del tenant (fuera del repo, nunca se versiona)."""
+    return Path(almacen.tenant_dir(tenant_id)) / ".env"
+
+
+def _leer_env_archivo(path: Path) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not path.exists():
+        return vals
+    for linea in path.read_text(encoding="utf-8").splitlines():
         linea = linea.strip()
         if linea and not linea.startswith("#") and "=" in linea:
             k, _, v = linea.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+            vals[k.strip()] = v.strip()
+    return vals
+
+
+def _cargar_env() -> None:
+    """Puebla os.environ desde el .env del tenant ACTIVO (KEY=valor por línea). El
+    entorno real gana sobre el .env (setdefault): quien ya exportó una var, la
+    mantiene. Sólo toca el proceso para el tenant activo — así el comportamiento de
+    una instalación single-tenant de siempre (una sola credencial, vía env vars o
+    `configurar`) queda idéntico a antes de este cambio.
+
+    Fallback: si el tenant activo es `tup` y todavía no tiene su propio `.env` (la
+    migración no corrió o no había nada que migrar), lee el `.env` plano legacy en la
+    raíz de `MOODLE_SKILL_HOME` — belt-and-suspenders con `migrar_legacy_a_tup`."""
+    tid = almacen.tenant_activo()
+    vals = _leer_env_archivo(_env_path(tid))
+    if tid == "tup" and not vals:
+        vals = _leer_env_archivo(Path(almacen.HOME) / ".env")
+    for k, v in vals.items():
+        os.environ.setdefault(k, v)
 
 
 _cargar_env()
 _REFRESCO_TIMEOUT_S = int(os.environ.get("REFRESCO_TIMEOUT_S", "300"))
-_cliente: MobileWSClient | None = None
+
+# Pool de clientes REST, uno por tenant/campus. El tenant activo sigue resolviéndose
+# vía os.environ (compat exacta con el comportamiento single-tenant de siempre); los
+# demás tenants del pool se arman leyendo DIRECTO su propio .env, sin tocar
+# os.environ — así no hay pisada de credenciales entre campus en el mismo proceso.
+_clientes: dict[str, MobileWSClient] = {}
 
 
-def _cli() -> MobileWSClient:
-    """Cliente REST del tutor (singleton). Relee el .env por si se configuró en esta
-    sesión (Claude corrió `configurar`). Falla claro si aún no hay credenciales."""
-    global _cliente
-    if _cliente is None:
+def _credenciales_de(tenant_id: str) -> dict[str, str]:
+    """Credenciales de un tenant puntual. Para el ACTIVO usa os.environ (que ya
+    incluye el .env propio vía `_cargar_env` + lo que haya exportado el tutor a
+    mano); para cualquier otro, lee su `.env` directo sin mutar el entorno global."""
+    if tenant_id == almacen.tenant_activo():
         _cargar_env()
-        base = os.environ.get("MOODLE_URL", _BASE_DEFAULT).rstrip("/")
-        user = os.environ.get("MOODLE_USER")
-        pw = os.environ.get("MOODLE_PASS")
+        return {
+            "MOODLE_URL": os.environ.get("MOODLE_URL", ""),
+            "MOODLE_USER": os.environ.get("MOODLE_USER", ""),
+            "MOODLE_PASS": os.environ.get("MOODLE_PASS", ""),
+        }
+    return _leer_env_archivo(_env_path(tenant_id))
+
+
+def _cli(tenant_id: str | None = None) -> MobileWSClient:
+    """Cliente REST del tenant pedido (default: el tenant activo). Cachea uno por
+    tenant en `_clientes` — así conmutar de campus con `usar_campus` no pierde el
+    cliente ya logueado del otro. Falla claro si aún no hay credenciales para ESE
+    tenant."""
+    tid = tenant_id or almacen.tenant_activo()
+    if tid not in _clientes:
+        creds = _credenciales_de(tid)
+        base = (creds.get("MOODLE_URL") or _BASE_DEFAULT).rstrip("/")
+        user = creds.get("MOODLE_USER")
+        pw = creds.get("MOODLE_PASS")
         if not user or not pw:
-            raise RuntimeError(
+            mensaje = (
                 "Todavía no configuraste tus credenciales. Decile a Claude tu usuario "
                 "y contraseña de Moodle y pedile que llame a `configurar` — las guarda "
-                f"en {_ENV_PATH}. (No hace falta setear env vars a mano.)"
+                f"en {_env_path(tid)}. (No hace falta setear env vars a mano.)"
+                if tid == almacen.tenant_activo() else
+                f"El campus '{tid}' todavía no tiene credenciales guardadas. Usá "
+                "`agregar_campus` para configurarlo."
             )
-        _cliente = MobileWSClient(base, user, pw)
-    return _cliente
+            raise RuntimeError(mensaje)
+        _clientes[tid] = MobileWSClient(base, user, pw)
+    return _clientes[tid]
 
 
-def _escribir_env(vals: dict[str, str]) -> None:
-    """Escribe/actualiza el .env local con permisos 600 (solo el tutor lo lee).
-    Preserva las claves que ya estaban y no se pasan de nuevo."""
-    existentes: dict[str, str] = {}
-    if _ENV_PATH.exists():
-        for l in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-            l = l.strip()
-            if l and not l.startswith("#") and "=" in l:
-                k, _, v = l.partition("=")
-                existentes[k.strip()] = v.strip()
+def _invalidar_cliente(tenant_id: str) -> None:
+    """Descarta el cliente cacheado de un tenant (para forzar recreación con
+    credenciales nuevas, p. ej. tras `configurar`/`agregar_campus`)."""
+    _clientes.pop(tenant_id, None)
+
+
+def _escribir_env(vals: dict[str, str], tenant_id: str | None = None) -> None:
+    """Escribe/actualiza el .env local del tenant con permisos 600 (solo el tutor lo
+    lee). Preserva las claves que ya estaban y no se pasan de nuevo."""
+    tid = tenant_id or almacen.tenant_activo()
+    path = _env_path(tid)
+    existentes: dict[str, str] = _leer_env_archivo(path)
     existentes.update({k: v for k, v in vals.items() if v})
-    _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     cuerpo = "# Credenciales de la skill TUP Campus Navigator. NO subir a git.\n" + \
              "\n".join(f"{k}={v}" for k, v in existentes.items()) + "\n"
-    _ENV_PATH.write_text(cuerpo, encoding="utf-8")
-    os.chmod(_ENV_PATH, 0o600)
-    for k, v in existentes.items():
-        os.environ[k] = v  # disponibles ya en esta sesión
+    path.write_text(cuerpo, encoding="utf-8")
+    os.chmod(path, 0o600)
+    if tid == almacen.tenant_activo():
+        for k, v in existentes.items():
+            os.environ[k] = v  # disponibles ya en esta sesión
+
+
+async def _configurar_credenciales(
+    tenant_id: str,
+    moodle_user: str,
+    moodle_pass: str,
+    moodle_url: str,
+    activeia_user: str = "",
+    activeia_pass: str = "",
+) -> dict:
+    """Helper compartido por `configurar` y `agregar_campus`: escribe el `.env` del
+    tenant y VALIDA el login contra su campus antes de darlo por bueno. Si el login
+    falla, deja el `.env` como estaba (rollback) y no persiste nada — el error vuelve
+    para que se revisen usuario/contraseña."""
+    vals = {"MOODLE_USER": moodle_user.strip(), "MOODLE_PASS": moodle_pass,
+            "MOODLE_URL": (moodle_url or _BASE_DEFAULT).rstrip("/")}
+    if activeia_user:
+        vals["ACTIVEIA_USER"] = activeia_user.strip()
+    if activeia_pass:
+        vals["ACTIVEIA_PASS"] = activeia_pass
+
+    path = _env_path(tenant_id)
+    previo = path.read_text(encoding="utf-8") if path.exists() else None
+    _escribir_env(vals, tenant_id)
+    _invalidar_cliente(tenant_id)
+    try:
+        cursos = await ws_api.descubrir_cursos(_cli(tenant_id))
+    except Exception as e:  # noqa: BLE001
+        # Rollback: no dejamos credenciales inválidas persistidas.
+        if previo is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(previo, encoding="utf-8")
+        _invalidar_cliente(tenant_id)
+        return {"ok": False, "error": f"Guardé las credenciales pero el login falló "
+                f"({type(e).__name__}). Revisá usuario y contraseña (el usuario de "
+                f"Moodle no siempre es el DNI). Detalle: {str(e)[:150]}"}
+    return {"ok": True, "env_path": str(path), "cursos": cursos}
 
 
 @mcp.tool()
@@ -120,28 +210,125 @@ async def configurar(
     contraseña NO se versiona) y VALIDA el login contra el campus antes de darlo por
     bueno. Reemplaza el tener que setear variables de entorno a mano.
 
+    Configura SIEMPRE el campus activo (por defecto `tup`); para sumar un campus
+    nuevo sin tocar el que ya está configurado, usá `agregar_campus`.
+
     Si el login falla, NO deja las credenciales como válidas: devuelve el error para
     que el tutor revise usuario/contraseña (ojo: el usuario de Moodle no siempre es el
     DNI)."""
-    global _cliente
-    vals = {"MOODLE_USER": moodle_user.strip(), "MOODLE_PASS": moodle_pass,
-            "MOODLE_URL": (moodle_url or _BASE_DEFAULT).rstrip("/")}
-    if activeia_user:
-        vals["ACTIVEIA_USER"] = activeia_user.strip()
-    if activeia_pass:
-        vals["ACTIVEIA_PASS"] = activeia_pass
-    _escribir_env(vals)
-    _cliente = None  # forzar recreación con las credenciales nuevas
-    # Validar contra el campus: un token + un descubrimiento liviano.
+    tid = almacen.tenant_activo()
+    res = await _configurar_credenciales(tid, moodle_user, moodle_pass, moodle_url,
+                                         activeia_user, activeia_pass)
+    if not res["ok"]:
+        return res
+    return {"ok": True, "mensaje": f"Credenciales validadas y guardadas en "
+            f"{res['env_path']}. Veo {len(res['cursos'])} cursos tuyos. Ya podés "
+            "mapear tus comisiones.", "cursos": len(res["cursos"])}
+
+
+# ---------- MULTI-CAMPUS ----------
+@mcp.tool()
+async def listar_campus() -> dict:
+    """Campus (tenants) registrados en esta máquina, con cuál está ACTIVO ahora mismo.
+    Una instalación nueva siempre tiene al menos `tup` (el default histórico). Usá
+    `agregar_campus` para sumar uno nuevo y `usar_campus` para cambiar cuál opera
+    `_cli()` por defecto en el resto de las tools."""
+    activo = almacen.tenant_activo()
+    return {"activo": activo,
+            "campus": [dict(t, activo=(t["id"] == activo)) for t in almacen.tenants()]}
+
+
+@mcp.tool()
+async def usar_campus(tenant_id: str) -> dict:
+    """Cambia el campus ACTIVO: todas las tools que no reciban un tenant explícito
+    (o sea, todas — hoy ninguna lo pide) empiezan a operar contra ese campus.
+
+    Rechaza un `tenant_id` que no esté registrado (usá `listar_campus` para ver los
+    disponibles, o `agregar_campus` para sumarlo primero) y en ese caso NO toca el
+    campus activo."""
+    ids = {t["id"] for t in almacen.tenants()}
+    if tenant_id not in ids:
+        return {"ok": False,
+                "error": f"'{tenant_id}' no está registrado. Campus disponibles: "
+                         f"{sorted(ids)}. Usá agregar_campus para sumarlo."}
+    almacen.set_tenant_activo(tenant_id)
+    return {"ok": True, "activo": tenant_id}
+
+
+@mcp.tool()
+async def agregar_campus(
+    tenant_id: str,
+    nombre: str,
+    url: str,
+    moodle_user: str,
+    moodle_pass: str,
+    activeia_user: str = "",
+    activeia_pass: str = "",
+) -> dict:
+    """Registra un campus NUEVO (otra UTN, otra sede) sin tocar el que ya está
+    configurado: no cambia el campus activo. Valida el login contra `url` ANTES de
+    persistir nada — igual que `configurar`. Si las credenciales son inválidas, no
+    queda ni `.env` ni entrada en `listar_campus`.
+
+    `tenant_id` es un slug propio (ej. `"tup"`, `"otra-utn"`) — tiene que ser único;
+    si ya existe un campus con ese id, se rechaza sin tocar nada.
+
+    Con login OK: guarda el `.env` del tenant (permisos 600), lo registra en
+    `tenants.json` y corre `descubrir_cursos`/`descubrir_comisiones` contra el campus
+    nuevo para sembrar su catálogo (`aulas.json`/`comisiones.json` propios). Después
+    de esto, `usar_campus(tenant_id)` lo deja operativo."""
+    ids = {t["id"] for t in almacen.tenants()}
+    if tenant_id in ids:
+        return {"ok": False,
+                "error": f"El campus '{tenant_id}' ya está registrado. Usá otro id, "
+                         "o `usar_campus` si ya es este."}
+
+    res = await _configurar_credenciales(tenant_id, moodle_user, moodle_pass, url,
+                                         activeia_user, activeia_pass)
+    if not res["ok"]:
+        return res
+
     try:
-        cursos = await ws_api.descubrir_cursos(_cli())
+        almacen.registrar_tenant(tenant_id, nombre, (url or _BASE_DEFAULT).rstrip("/"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    # Sembrar el catálogo del tenant nuevo. Que esto falle no revierte el registro:
+    # el campus ya quedó configurado y usable, sólo faltaría correr el descubrimiento
+    # a mano si esto no anduvo.
+    aviso = None
+    try:
+        cursos = await ws_api.descubrir_cursos(_cli(tenant_id))
+        aulas_out = Path(almacen.tenant_dir(tenant_id)) / "aulas.json"
+        aulas_out.write_text(
+            json.dumps({"materias": [
+                {"materia": c.get("nombre"), "course_id": c.get("course_id")}
+                for c in cursos]}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        comisiones_out = Path(almacen.tenant_dir(tenant_id)) / "comisiones.json"
+        materias_com = []
+        for c in cursos:
+            try:
+                grupos = await ws_api.descubrir_comisiones(_cli(tenant_id), c.get("course_id"))
+            except Exception:  # noqa: BLE001
+                grupos = []
+            materias_com.append({"materia": c.get("nombre"),
+                                 "course_id": c.get("course_id"), "comisiones": grupos})
+        comisiones_out.write_text(
+            json.dumps({"materias": materias_com}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"Guardé las credenciales pero el login falló "
-                f"({type(e).__name__}). Revisá usuario y contraseña (el usuario de "
-                f"Moodle no siempre es el DNI). Detalle: {str(e)[:150]}"}
-    return {"ok": True, "mensaje": f"Credenciales validadas y guardadas en {_ENV_PATH}. "
-            f"Veo {len(cursos)} cursos tuyos. Ya podés mapear tus comisiones.",
-            "cursos": len(cursos)}
+        aviso = (f"El campus quedó registrado y con login OK, pero no pude sembrar su "
+                 f"catálogo ({type(e).__name__}: {str(e)[:150]}). Corré "
+                 "descubrir_cursos/descubrir_comisiones a mano con usar_campus.")
+
+    salida = {"ok": True, "tenant_id": tenant_id, "cursos": len(res["cursos"]),
+              "mensaje": f"Campus '{tenant_id}' registrado y validado. "
+                        f"Veo {len(res['cursos'])} cursos. Usá usar_campus('{tenant_id}') "
+                        "para operar contra él."}
+    if aviso:
+        salida["aviso"] = aviso
+    return salida
 
 
 # ---------- VERSIÓN Y ACTUALIZACIÓN ----------
@@ -188,7 +375,7 @@ def _raices_de_materias() -> list[str]:
     que nadie verificó.
     """
     try:
-        cat = json.loads(_AULAS_PATH.read_text(encoding="utf-8"))
+        cat = json.loads(_AULAS_PATH_REPO.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     raices = []
@@ -276,7 +463,21 @@ async def mis_datos() -> dict:
     return salida
 
 
-_AULAS_PATH = Path(__file__).parent / "aulas.json"
+_AULAS_PATH_REPO = Path(__file__).parent / "aulas.json"
+
+
+def _ruta_catalogo(nombre_archivo: str, path_repo: Path) -> Path | None:
+    """Resuelve qué archivo de catálogo leer para el tenant ACTIVO, en orden:
+    1. El propio del tenant (`tenant_dir()/<nombre_archivo>`), si existe.
+    2. El repo-shipped (`mcp/<nombre_archivo>`), SOLO si el tenant activo es `tup`
+       (el default histórico, con catálogo curado a mano en el repo).
+    3. Ninguno (`None`) — un tenant no-tup sin descubrimiento propio todavía."""
+    propio = Path(almacen.tenant_dir()) / nombre_archivo
+    if propio.exists():
+        return propio
+    if almacen.tenant_activo() == "tup" and path_repo.exists():
+        return path_repo
+    return None
 
 
 @mcp.tool()
@@ -290,8 +491,12 @@ async def aulas() -> dict:
     ya NO existe en la cuenta del tutor, o el catálogo venció, se avisa y hay que caer a
     `descubrir_cursos` en vivo. NUNCA se mapea un aula que el tutor no tiene."""
     import datetime
+    ruta = _ruta_catalogo("aulas.json", _AULAS_PATH_REPO)
+    if ruta is None:
+        return {"error": "Todavía no hay catálogo de aulas para este campus. Usá "
+                         "descubrir_cursos para mapear en vivo."}
     try:
-        cat = json.loads(_AULAS_PATH.read_text(encoding="utf-8"))
+        cat = json.loads(ruta.read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
         return {"error": f"No pude leer el catálogo de aulas: {e}. Usá descubrir_cursos."}
 
@@ -420,7 +625,7 @@ async def anotar_aprendizaje(course_id: int, regla: str, quien: str,
 
     materia = next((m for m in cat.get("materias", []) if m.get("course_id") == course_id), None)
     if materia is None:
-        cat_aulas = json.loads(_AULAS_PATH.read_text(encoding="utf-8"))
+        cat_aulas = json.loads(_AULAS_PATH_REPO.read_text(encoding="utf-8"))
         nombre = next((a["materia"] for a in cat_aulas.get("materias", [])
                        if a.get("course_id") == course_id), f"(course {course_id})")
         materia = {"materia": nombre, "course_id": course_id, "aprendizajes": []}
@@ -449,7 +654,7 @@ async def anotar_aprendizaje(course_id: int, regla: str, quien: str,
     }
 
 
-_COMISIONES_PATH = Path(__file__).parent / "comisiones.json"
+_COMISIONES_PATH_REPO = Path(__file__).parent / "comisiones.json"
 
 
 def _clave_nombre(texto: str) -> str:
@@ -478,8 +683,12 @@ async def mi_comision(nombre: str) -> dict:
     VALIDACIÓN (la regla de la skill: verificar en vivo, nunca inventar): cada group_id
     del catálogo se coteja contra los grupos reales del curso antes de devolverlo. Si el
     catálogo quedó viejo, lo dice y manda a descubrir_comisiones en vivo."""
+    ruta = _ruta_catalogo("comisiones.json", _COMISIONES_PATH_REPO)
+    if ruta is None:
+        return {"error": "Todavía no hay catálogo de comisiones para este campus. "
+                         "Mapeá en vivo con descubrir_comisiones + listar_tareas."}
     try:
-        cat = json.loads(_COMISIONES_PATH.read_text(encoding="utf-8"))
+        cat = json.loads(ruta.read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
         return {"error": f"No pude leer el catálogo de comisiones: {e}. "
                          "Mapeá en vivo con descubrir_comisiones + listar_tareas."}
@@ -722,6 +931,7 @@ async def material_encuentro(course_id: int, url: str | None = None) -> dict:
 
     Read-only: no escribe nada en el campus. Para publicar la respuesta, `responder_foro`
     (que pide tu OK, como siempre)."""
+    _cargar_env()
     base = os.environ.get("MOODLE_URL", _BASE_DEFAULT).rstrip("/")
     return await encuentros.material_encuentro(_cli(), base, course_id, url)
 
@@ -1300,7 +1510,7 @@ async def ver_entrega(assign_id: str, email: str, max_chars: int = 20000) -> dic
     Read-only: no escribe nada en el campus. Para corregir con IA en vez de a mano está
     `corregir_con_active_ia` (usa la rúbrica oficial, si la unidad tiene una cargada).
     """
-    destino = str(Path(almacen.SALIDAS_DIR) / "entregas" / str(assign_id))
+    destino = str(Path(almacen.salidas_dir()) / "entregas" / str(assign_id))
     return await ws_api.leer_entrega(_cli(), assign_id, email, destino, max_chars)
 
 
@@ -1337,8 +1547,9 @@ async def auditar_aula(course_id: int, materia: str = "", evaluador: str = "",
     encabezado (ej. 'Programación 2'); `evaluador`/`rol` son opcionales (dejá `evaluador`
     vacío para firmar como Celda de Control de Calidad)."""
     return await auditoria.auditar_aula(
-        _cli(), course_id, almacen.SALIDAS_DIR, materia=materia, evaluador=evaluador,
-        rol=rol, con_navegador=con_navegador, unidad=unidad)
+        _cli(), course_id, almacen.salidas_dir(), materia=materia, evaluador=evaluador,
+        rol=rol, con_navegador=con_navegador, unidad=unidad,
+        tenant_id=almacen.tenant_activo())
 
 
 # ---------- VISTA DEL PROFESOR (todas las comisiones a la vez) ----------
@@ -1427,7 +1638,7 @@ async def reporte_coordinacion(course_id: int, cmids: list[str] | None = None,
     try:
         nombre = await panorama._nombre_del_curso(_cli(), course_id)
         datos["pdf"] = informes.reporte_coordinacion_pdf(
-            datos, str(Path(almacen.SALIDAS_DIR) / "informes"),
+            datos, str(Path(almacen.salidas_dir()) / "informes"),
             materia=nombre or "", fecha=date.today().isoformat(), anexo=anexo)
     except Exception as e:  # noqa: BLE001
         # Que falle el render no puede tirar el relevamiento del curso entero.
@@ -1510,7 +1721,7 @@ async def informes_nexos(course_id: int, dias_desenganche: int = 7,
         return datos
     try:
         datos["pdf"] = informes.informe_nexos_pdf(
-            datos, str(Path(almacen.SALIDAS_DIR) / "informes"),
+            datos, str(Path(almacen.salidas_dir()) / "informes"),
             materia=datos.get("curso") or "", fecha=date.today().isoformat(),
             emails=emails)
     except Exception as e:  # noqa: BLE001
@@ -1537,7 +1748,7 @@ async def armar_informe(course_id: int | None = None, group_id: int = 0) -> dict
     if not cid:
         return {"error": True, "mensaje": "No sé de qué curso armar el informe: pasá "
                 "course_id o mapeá tus datos primero (descubrir_cursos -> guardar_mis_datos)."}
-    return await informes.informe_pendientes(_cli(), cid, almacen.SALIDAS_DIR, group_id=group_id)
+    return await informes.informe_pendientes(_cli(), cid, almacen.salidas_dir(), group_id=group_id)
 
 
 @mcp.tool()
@@ -1664,7 +1875,7 @@ async def informe_alumnos(course_id: int, group_id: int = 0, pdf: bool = True,
             nombre = await panorama._nombre_del_curso(_cli(), course_id)
         except Exception:  # noqa: BLE001
             nombre = ""
-        destino = str(Path(almacen.SALIDAS_DIR) / "informes")
+        destino = str(Path(almacen.salidas_dir()) / "informes")
         hechos, fallados = [], []
         for b in datos["comisiones"]:
             try:
@@ -2043,7 +2254,7 @@ async def siguiente_para_corregir(assign_id: str | None = None,
                              if restan else "La cola está vacía."))}
     entrega = await ws_api.leer_entrega(
         _cli(), fila["assign_id"], fila["email"],
-        str(Path(almacen.SALIDAS_DIR) / "entregas" / str(fila["assign_id"])), max_chars)
+        str(Path(almacen.salidas_dir()) / "entregas" / str(fila["assign_id"])), max_chars)
     faltan = await almacen.cola_listar(fila["assign_id"], fila["group_id"],
                                        estados=("pendiente",))
     return {"ok": True, "alumno": fila["alumno"], "email": fila["email"],

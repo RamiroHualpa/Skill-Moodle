@@ -21,19 +21,19 @@
 
 ## 2. Client pool and campus tools (`mcp/server.py`)
 
-- [ ] 2.1 Replace the module-global `_cliente`/`_cli()` singleton with a
+- [x] 2.1 Replace the module-global `_cliente`/`_cli()` singleton with a
       `_clientes: dict[str, MobileWSClient]` pool plus per-tenant `asyncio.Lock`,
       keyed by `tenant_id` (default: `almacen.tenant_activo()`); verify existing
       tools still work unchanged (run one read-only tool, e.g. `mis_datos`, against
       the default `tup` tenant with no other tenant configured).
-- [ ] 2.2 Add `listar_campus()` tool returning every registered tenant (id, nombre,
+- [x] 2.2 Add `listar_campus()` tool returning every registered tenant (id, nombre,
       url) with the active one marked; verify by calling it on a fresh install and
       confirming it returns exactly the `tup` default.
-- [ ] 2.3 Add `usar_campus(tenant_id)` tool: validates the id is registered, calls
+- [x] 2.3 Add `usar_campus(tenant_id)` tool: validates the id is registered, calls
       `almacen.set_tenant_activo`, returns confirmation; verify it rejects an
       unregistered id without changing the active tenant (call `listar_campus`
       before/after to confirm no change).
-- [ ] 2.4 Add `agregar_campus(tenant_id, nombre, url, moodle_user, moodle_pass,
+- [x] 2.4 Add `agregar_campus(tenant_id, nombre, url, moodle_user, moodle_pass,
       activeia_user="", activeia_pass="")` tool: validates login against `url`
       (reuse the same login-check path `configurar` uses today) before persisting
       anything; on success writes that tenant's `.env` (mode 600),
@@ -44,18 +44,18 @@
       success path (tenant appears in `listar_campus`, its `.env` exists) and the
       failure path (invalid creds → tenant NOT in `listar_campus`, no `.env`
       written) against a real or sandbox Moodle instance.
-- [ ] 2.5 Refactor `configurar` to share logic with `agregar_campus` via a common
+- [x] 2.5 Refactor `configurar` to share logic with `agregar_campus` via a common
       internal helper, but keep operating implicitly on the active tenant (no new
       required params); verify by calling `configurar` exactly as before (no tenant
       awareness) and confirming identical behavior/output shape to before this
       change.
-- [ ] 2.6 Update the `aulas.json`/`comisiones.json` read path (currently
+- [x] 2.6 Update the `aulas.json`/`comisiones.json` read path (currently
       `Path(__file__).parent/...`) to the resolution order: per-tenant
       `~/.moodle-skill/<tenant>/aulas.json` (if present) → repo-shipped catalog
       only when active tenant is `tup` → empty with a message pointing at discovery
       tools; verify with three cases (tup with no override, tup with an override
       file present, a non-tup tenant with no discovered file yet).
-- [ ] 2.7 Scope `mcp/moodle/navegador.py`'s `_AUTH_DIR` to
+- [x] 2.7 Scope `mcp/moodle/navegador.py`'s `_AUTH_DIR` to
       `almacen.tenant_dir(tenant_id)` instead of the flat `MOODLE_SKILL_HOME`;
       verify by running `auditar_aula` (or its underlying browser-session setup)
       against two different tenants in the same process and confirming their
