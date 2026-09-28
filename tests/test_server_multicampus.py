@@ -11,7 +11,6 @@ SÍ leen archivos reales del repo (`mcp/aprendizajes.json`) a propósito; estos 
 Correr:  python -m unittest discover -s tests -v
 """
 
-import atexit
 import importlib
 import json
 import os
@@ -21,19 +20,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
-
 # IMPORTANTE — orden de import: `server.py` corre `almacen.migrar_legacy_a_tup()` como
-# side-effect AL IMPORTAR (ver su docstring de módulo). Si `MOODLE_SKILL_HOME` no está
-# seteado ANTES de este `import server`, la migración automática corre contra el
-# `~/.moodle-skill` REAL de quien ejecuta los tests — esto pasó de verdad en una máquina
-# de desarrollo (inofensivo: la migración sólo COPIA y se verificó byte-idéntica, pero no
-# debe volver a pasar). Por eso se fija un home temporal de MÓDULO acá, ANTES del import,
-# separado del home temporal por-test de `_ConHomeTemporal` (que sigue existiendo para
-# aislar cada test entre sí vía `importlib.reload`).
-_HOME_IMPORT_TMP = tempfile.TemporaryDirectory()
-os.environ["MOODLE_SKILL_HOME"] = _HOME_IMPORT_TMP.name
-atexit.register(_HOME_IMPORT_TMP.cleanup)
+# side-effect AL IMPORTAR (ver su docstring de módulo), y `almacen.HOME` se fija UNA
+# SOLA VEZ al importar. Si `MOODLE_SKILL_HOME` no está seteado ANTES de este
+# `import server`, la migración automática corre contra el `~/.moodle-skill` REAL de
+# quien ejecuta los tests — esto pasó de verdad en una máquina de desarrollo (inofensivo:
+# la migración sólo COPIA y se verificó byte-idéntica, pero no debe volver a pasar). Ver
+# tests/_env_setup.py para el detalle completo de por qué esto tiene que ser el PRIMER
+# import del archivo que pueda llegar a `almacen`/`server`, sin depender del orden en que
+# `discover` importe los demás archivos de test.
+import _env_setup  # noqa: E402,F401
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
 
 from moodle import almacen  # noqa: E402
 import server  # noqa: E402

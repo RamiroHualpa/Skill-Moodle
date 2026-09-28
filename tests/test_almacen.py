@@ -21,6 +21,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# Debe ser el primer import que pueda llegar a `moodle.almacen`: bajo el comando
+# documentado (`python -m unittest discover -s tests`, sin `-t`) este archivo es
+# el primero que `discover` importa alfabéticamente, y `almacen.HOME` se fija UNA
+# SOLA VEZ al importar. Ver tests/_env_setup.py para el detalle completo.
+import _env_setup  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
 
 from moodle import almacen  # noqa: E402

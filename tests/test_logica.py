@@ -15,6 +15,11 @@ import sys
 import unittest
 from pathlib import Path
 
+# `moodle.active_ia` (importado más abajo) llega a `moodle.almacen`, cuyo `HOME` se
+# fija UNA SOLA VEZ al importar. Este import tiene que ir antes de ese, en todo
+# archivo que lo alcance. Ver tests/_env_setup.py para el detalle completo.
+import _env_setup  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
 
 from moodle.cliente import MoodleWSError  # noqa: E402
