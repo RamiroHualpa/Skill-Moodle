@@ -69,15 +69,19 @@ def _leer_env_archivo(path: Path) -> dict[str, str]:
 
 
 def _cargar_env() -> None:
-    """Puebla os.environ desde el .env del tenant ACTIVO (KEY=valor por línea). El
-    entorno real gana sobre el .env (setdefault): quien ya exportó una var, la
-    mantiene. Sólo toca el proceso para el tenant activo — así el comportamiento de
-    una instalación single-tenant de siempre (una sola credencial, vía env vars o
-    `configurar`) queda idéntico a antes de este cambio.
+    """Puebla os.environ desde el .env del tenant ACTIVO (KEY=valor por línea), UNA
+    VEZ al importar el módulo. El entorno real gana sobre el .env (setdefault): quien
+    ya exportó una var, la mantiene. Esto es SÓLO para compat con cosas que de verdad
+    son proceso-wide (p. ej. `REFRESCO_TIMEOUT_S`) y con el tutor legacy que exporta
+    `MOODLE_URL`/`MOODLE_USER`/`MOODLE_PASS` a mano en vez de usar `configurar`.
 
-    Fallback: si el tenant activo es `tup` y todavía no tiene su propio `.env` (la
-    migración no corrió o no había nada que migrar), lee el `.env` plano legacy en la
-    raíz de `MOODLE_SKILL_HOME` — belt-and-suspenders con `migrar_legacy_a_tup`."""
+    IMPORTANTE — esto NO es la fuente de verdad de credenciales por-tenant: eso es
+    `_credenciales_de()`, que lee el `.env` de cada tenant DIRECTO del archivo. Llamar
+    `_cargar_env()` de nuevo después de un `usar_campus` NO debe usarse para refrescar
+    credenciales — con `setdefault`, una vez que `os.environ` tiene las del primer
+    tenant cargado en el proceso, las de cualquier tenant siguiente quedarían pisadas
+    en silencio (el bug real que tenía esta función antes: cambiar de campus dejaba
+    el cliente nuevo logueándose con usuario/contraseña del campus viejo)."""
     tid = almacen.tenant_activo()
     vals = _leer_env_archivo(_env_path(tid))
     if tid == "tup" and not vals:
@@ -89,25 +93,34 @@ def _cargar_env() -> None:
 _cargar_env()
 _REFRESCO_TIMEOUT_S = int(os.environ.get("REFRESCO_TIMEOUT_S", "300"))
 
-# Pool de clientes REST, uno por tenant/campus. El tenant activo sigue resolviéndose
-# vía os.environ (compat exacta con el comportamiento single-tenant de siempre); los
-# demás tenants del pool se arman leyendo DIRECTO su propio .env, sin tocar
-# os.environ — así no hay pisada de credenciales entre campus en el mismo proceso.
+# Pool de clientes REST, uno por tenant/campus.
 _clientes: dict[str, MobileWSClient] = {}
 
 
 def _credenciales_de(tenant_id: str) -> dict[str, str]:
-    """Credenciales de un tenant puntual. Para el ACTIVO usa os.environ (que ya
-    incluye el .env propio vía `_cargar_env` + lo que haya exportado el tutor a
-    mano); para cualquier otro, lee su `.env` directo sin mutar el entorno global."""
-    if tenant_id == almacen.tenant_activo():
-        _cargar_env()
-        return {
+    """Credenciales de un tenant puntual, leídas DIRECTO de su propio `.env` —
+    NUNCA de `os.environ`, que es compartido por TODO el proceso: usarlo como fuente
+    de verdad por-tenant es lo que mezclaba credenciales entre campus después de un
+    `usar_campus` (el `.env` de cada tenant, vía `_env_path`, es la única fuente).
+
+    Único fallback a `os.environ`, y sólo para el tenant ACTIVO: un tutor legacy que
+    nunca pasó por `configurar`/`agregar_campus` y en cambio exportó
+    MOODLE_URL/MOODLE_USER/MOODLE_PASS a mano — mismo comportamiento single-tenant de
+    siempre. Nunca se usa `os.environ` para resolver un tenant que NO es el activo."""
+    vals = _leer_env_archivo(_env_path(tenant_id))
+    if not vals and tenant_id == "tup":
+        vals = _leer_env_archivo(Path(almacen.HOME) / ".env")
+    if not vals and tenant_id == almacen.tenant_activo():
+        legacy = {
             "MOODLE_URL": os.environ.get("MOODLE_URL", ""),
             "MOODLE_USER": os.environ.get("MOODLE_USER", ""),
             "MOODLE_PASS": os.environ.get("MOODLE_PASS", ""),
+            "ACTIVEIA_USER": os.environ.get("ACTIVEIA_USER", ""),
+            "ACTIVEIA_PASS": os.environ.get("ACTIVEIA_PASS", ""),
         }
-    return _leer_env_archivo(_env_path(tenant_id))
+        if legacy.get("MOODLE_USER") and legacy.get("MOODLE_PASS"):
+            vals = legacy
+    return vals
 
 
 def _cli(tenant_id: str | None = None) -> MobileWSClient:
@@ -142,8 +155,15 @@ def _invalidar_cliente(tenant_id: str) -> None:
 
 
 def _escribir_env(vals: dict[str, str], tenant_id: str | None = None) -> None:
-    """Escribe/actualiza el .env local del tenant con permisos 600 (solo el tutor lo
-    lee). Preserva las claves que ya estaban y no se pasan de nuevo."""
+    """Escribe/actualiza el .env local del tenant. Preserva las claves que ya
+    estaban y no se pasan de nuevo.
+
+    Permisos: `os.chmod(path, 0o600)` es real seguridad de acceso en Linux/macOS
+    (POSIX), pero en Windows NTFS `chmod` sólo alterna el flag de sólo-lectura — NO
+    es equivalente a permisos Unix 600 y NO restringe qué otras cuentas de Windows
+    pueden leer el archivo. Documentado acá como limitación conocida en vez de dejar
+    que el comentario prometa una propiedad de seguridad que en Windows no se
+    cumple."""
     tid = tenant_id or almacen.tenant_activo()
     path = _env_path(tid)
     existentes: dict[str, str] = _leer_env_archivo(path)
@@ -166,34 +186,39 @@ async def _configurar_credenciales(
     activeia_user: str = "",
     activeia_pass: str = "",
 ) -> dict:
-    """Helper compartido por `configurar` y `agregar_campus`: escribe el `.env` del
-    tenant y VALIDA el login contra su campus antes de darlo por bueno. Si el login
-    falla, deja el `.env` como estaba (rollback) y no persiste nada — el error vuelve
-    para que se revisen usuario/contraseña."""
-    vals = {"MOODLE_USER": moodle_user.strip(), "MOODLE_PASS": moodle_pass,
-            "MOODLE_URL": (moodle_url or _BASE_DEFAULT).rstrip("/")}
+    """Helper compartido por `configurar` y `agregar_campus`: VALIDA el login ANTES
+    de escribir nada a disco (requisito del spec — ver `specs/multi-tenant-moodle`,
+    "Invalid credentials are rejected without side effects"). El cliente de prueba se
+    arma 100% EN MEMORIA, sin tocar `.env` ni crear el directorio del tenant; sólo si
+    el login funciona se persiste.
+
+    Esto no es sólo orden estético: elimina de raíz toda la clase de bugs de
+    "rollback con huecos" que tenía la versión anterior (escribir primero, loguear
+    después, deshacer si falla) — un `asyncio.CancelledError` durante el login (que
+    es `BaseException`, no `Exception`, así que un `except Exception` no lo atrapa) ya
+    no puede dejar un `.env` huérfano con una contraseña real para un tenant nunca
+    registrado, porque nunca se llegó a escribir nada."""
+    base = (moodle_url or _BASE_DEFAULT).rstrip("/")
+    user = moodle_user.strip()
+    cliente_prueba = MobileWSClient(base, user, moodle_pass)
+    try:
+        cursos = await ws_api.descubrir_cursos(cliente_prueba)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"El login falló ({type(e).__name__}). Revisá "
+                f"usuario y contraseña (el usuario de Moodle no siempre es el DNI). "
+                f"No guardé nada. Detalle: {str(e)[:150]}"}
+
+    vals = {"MOODLE_USER": user, "MOODLE_PASS": moodle_pass, "MOODLE_URL": base}
     if activeia_user:
         vals["ACTIVEIA_USER"] = activeia_user.strip()
     if activeia_pass:
         vals["ACTIVEIA_PASS"] = activeia_pass
-
-    path = _env_path(tenant_id)
-    previo = path.read_text(encoding="utf-8") if path.exists() else None
     _escribir_env(vals, tenant_id)
-    _invalidar_cliente(tenant_id)
-    try:
-        cursos = await ws_api.descubrir_cursos(_cli(tenant_id))
-    except Exception as e:  # noqa: BLE001
-        # Rollback: no dejamos credenciales inválidas persistidas.
-        if previo is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_text(previo, encoding="utf-8")
-        _invalidar_cliente(tenant_id)
-        return {"ok": False, "error": f"Guardé las credenciales pero el login falló "
-                f"({type(e).__name__}). Revisá usuario y contraseña (el usuario de "
-                f"Moodle no siempre es el DNI). Detalle: {str(e)[:150]}"}
-    return {"ok": True, "env_path": str(path), "cursos": cursos}
+    # Reusa el cliente ya logueado en vez de descartarlo y obligar a `_cli()` a
+    # loguearse de nuevo — y de paso deja el pool consistente con lo recién escrito.
+    _clientes[tenant_id] = cliente_prueba
+    active_ia.invalidar_cliente(tenant_id)
+    return {"ok": True, "env_path": str(_env_path(tenant_id)), "cursos": cursos}
 
 
 @mcp.tool()
@@ -270,18 +295,20 @@ async def agregar_campus(
     persistir nada — igual que `configurar`. Si las credenciales son inválidas, no
     queda ni `.env` ni entrada en `listar_campus`.
 
-    `tenant_id` es un slug propio (ej. `"tup"`, `"otra-utn"`) — tiene que ser único;
-    si ya existe un campus con ese id, se rechaza sin tocar nada.
+    `tenant_id` es un slug propio (ej. `"tup"`, `"otra-utn"`): sólo minúsculas,
+    números y guiones, 1-40 caracteres, y tiene que ser único (comparado SIN importar
+    mayúsculas — "TUP" se rechaza si ya existe "tup", porque en Windows terminarían
+    siendo el mismo directorio). `.`, `..` y vacío se rechazan siempre.
 
-    Con login OK: guarda el `.env` del tenant (permisos 600), lo registra en
-    `tenants.json` y corre `descubrir_cursos`/`descubrir_comisiones` contra el campus
-    nuevo para sembrar su catálogo (`aulas.json`/`comisiones.json` propios). Después
-    de esto, `usar_campus(tenant_id)` lo deja operativo."""
-    ids = {t["id"] for t in almacen.tenants()}
-    if tenant_id in ids:
-        return {"ok": False,
-                "error": f"El campus '{tenant_id}' ya está registrado. Usá otro id, "
-                         "o `usar_campus` si ya es este."}
+    Con login OK: guarda el `.env` del tenant, lo registra en `tenants.json` y corre
+    `descubrir_cursos`/`descubrir_comisiones` contra el campus nuevo para sembrar su
+    catálogo (`aulas.json`/`comisiones.json` propios). Después de esto,
+    `usar_campus(tenant_id)` lo deja operativo."""
+    # Validar el id ANTES de tocar cualquier cosa (red, disco, registro) — un id
+    # inválido (colisión de mayúsculas, "..", vacío) no debe ni intentar loguearse.
+    error_id = almacen.validar_tenant_id(tenant_id)
+    if error_id:
+        return {"ok": False, "error": error_id}
 
     res = await _configurar_credenciales(tenant_id, moodle_user, moodle_pass, url,
                                          activeia_user, activeia_pass)
@@ -298,12 +325,20 @@ async def agregar_campus(
     # a mano si esto no anduvo.
     aviso = None
     try:
+        import datetime as _dt
+
         cursos = await ws_api.descubrir_cursos(_cli(tenant_id))
+        hoy = _dt.date.today()
+        mes = hoy.month - 1 + 6
+        vigente_hasta = f"{hoy.year + mes // 12:04d}-{mes % 12 + 1:02d}"
         aulas_out = Path(almacen.tenant_dir(tenant_id)) / "aulas.json"
         aulas_out.write_text(
-            json.dumps({"materias": [
-                {"materia": c.get("nombre"), "course_id": c.get("course_id")}
-                for c in cursos]}, ensure_ascii=False, indent=2),
+            json.dumps({
+                "cohorte": f"Descubierto {hoy.isoformat()}",
+                "vigente_hasta": vigente_hasta,
+                "materias": [{"materia": c.get("nombre"), "course_id": c.get("course_id")}
+                            for c in cursos],
+            }, ensure_ascii=False, indent=2),
             encoding="utf-8")
         comisiones_out = Path(almacen.tenant_dir(tenant_id)) / "comisiones.json"
         materias_com = []
@@ -312,10 +347,24 @@ async def agregar_campus(
                 grupos = await ws_api.descubrir_comisiones(_cli(tenant_id), c.get("course_id"))
             except Exception:  # noqa: BLE001
                 grupos = []
+            # Sólo los grupos tipo "comisión" (no regionales ni "otro") — mismo
+            # criterio que el catálogo curado a mano. Sin "tutor": el descubrimiento
+            # automático no conoce el reparto tutor->comisión, y `mi_comision` (y
+            # cualquier otro lector) trata su ausencia como "todavía sin asignar",
+            # no como un error.
+            comisiones = [
+                {"comision": g.get("nombre"), "nombre_campus": g.get("nombre"),
+                 "group_id": g.get("group_id")}
+                for g in grupos if g.get("tipo") == "comision"
+            ]
             materias_com.append({"materia": c.get("nombre"),
-                                 "course_id": c.get("course_id"), "comisiones": grupos})
+                                 "course_id": c.get("course_id"), "comisiones": comisiones})
         comisiones_out.write_text(
-            json.dumps({"materias": materias_com}, ensure_ascii=False, indent=2),
+            json.dumps({
+                "cohorte": f"Descubierto {hoy.isoformat()}",
+                "vigente_hasta": vigente_hasta,
+                "materias": materias_com,
+            }, ensure_ascii=False, indent=2),
             encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         aviso = (f"El campus quedó registrado y con login OK, pero no pude sembrar su "
@@ -712,8 +761,13 @@ async def mi_comision(nombre: str) -> dict:
 
     encontradas = exactos or parciales
     if not encontradas:
+        # `.get("tutor")` y no `c["tutor"]`: una comisión recién descubierta por
+        # `agregar_campus` (sin reparto tutor->comisión todavía) no trae la clave
+        # "tutor" en absoluto — antes esto tiraba KeyError acá (confirmado en el
+        # review). Ausente/vacío se trata como "todavía sin asignar", no como error,
+        # y no entra en la lista de tutores conocidos.
         tutores = sorted({c["tutor"] for m in cat.get("materias", [])
-                          for c in m.get("comisiones", [])})
+                          for c in m.get("comisiones", []) if c.get("tutor")})
         return {"sin_resultado": True,
                 "aviso": f"No encontré a '{nombre}' en el reparto de {cat.get('cohorte')}. "
                          "Puede que la comisión no esté asignada todavía, o que el nombre "
@@ -931,8 +985,11 @@ async def material_encuentro(course_id: int, url: str | None = None) -> dict:
 
     Read-only: no escribe nada en el campus. Para publicar la respuesta, `responder_foro`
     (que pide tu OK, como siempre)."""
-    _cargar_env()
-    base = os.environ.get("MOODLE_URL", _BASE_DEFAULT).rstrip("/")
+    # Tenant-aware: antes leía MOODLE_URL de os.environ (proceso global), así que
+    # después de un usar_campus seguía armando la URL del campus VIEJO. Misma
+    # resolución que `_cli()`: el .env propio del tenant activo.
+    base = (_credenciales_de(almacen.tenant_activo()).get("MOODLE_URL")
+            or _BASE_DEFAULT).rstrip("/")
     return await encuentros.material_encuentro(_cli(), base, course_id, url)
 
 

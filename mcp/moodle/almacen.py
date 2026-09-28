@@ -17,6 +17,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 import shutil
 import sqlite3
 from typing import Any
@@ -69,12 +70,55 @@ def tenants() -> list[dict]:
         return [{"id": _TENANT_DEFAULT_ID, "nombre": "TUP (UTN)", "url": _TENANT_DEFAULT_URL}]
 
 
+# Formato del id de tenant: minúsculas, dígitos y guiones, 1-40 caracteres. Sólo
+# minúsculas a propósito — en Windows (NTFS) el filesystem es case-INsensitive, así que
+# "TUP" y "tup" son EL MISMO directorio; si se permitiera mayúsculas, registrar "TUP"
+# pisaría en silencio el .env real de "tup" con credenciales de otro campus (repro
+# confirmado por el review). Comparar todo en minúsculas evita la colisión de raíz en
+# vez de andar detectándola caso por caso.
+_TENANT_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
+# Reservados/peligrosos explícitos, aunque el regex ya los rechazaría salvo por vacío
+# (que el regex también rechaza por el {1,40}, pero lo dejamos explícito por claridad
+# del mensaje de error).
+_TENANT_ID_RESERVADOS = {"", ".", ".."}
+
+
+def validar_tenant_id(tenant_id: str, existentes: list[dict] | None = None) -> str | None:
+    """Valida un `tenant_id` suministrado por el tutor (o por cualquier caller) ANTES
+    de usarlo para construir un path o registrarlo. Devuelve un mensaje de error en
+    castellano si es inválido, o `None` si está OK para usar.
+
+    Reglas: sólo `[a-z0-9-]`, 1 a 40 caracteres; nunca vacío, `.` ni `..` (esos dos
+    escaparían del directorio del tenant o pisarían el HOME); y no puede colisionar,
+    comparando SIN importar mayúsculas/minúsculas, con un tenant ya registrado — así
+    "TUP" se rechaza como duplicado de "tup" en vez de crear un directorio que en
+    Windows termina siendo el mismo que el de "tup" pero con otro `.env` adentro."""
+    if tenant_id in _TENANT_ID_RESERVADOS:
+        return "El id de campus no puede estar vacío, ni ser '.' o '..'."
+    if not _TENANT_ID_RE.match(tenant_id):
+        return ("El id de campus sólo puede tener minúsculas, números y guiones "
+                "('-'), sin espacios, mayúsculas ni barras (ej: 'otra-utn'). Recibí "
+                f"{tenant_id!r}.")
+    actuales = tenants() if existentes is None else existentes
+    lower = tenant_id.lower()
+    for t in actuales:
+        if str(t.get("id", "")).lower() == lower:
+            return (f"El campus '{tenant_id}' colisiona con el ya registrado "
+                     f"'{t.get('id')}' (los ids se comparan sin importar mayúsculas, "
+                     "porque en Windows son el mismo directorio en disco).")
+    return None
+
+
 def registrar_tenant(tenant_id: str, nombre: str, url: str) -> dict:
-    """Agrega un tenant nuevo al registro. Lanza `ValueError` si el id ya existe —
-    nunca pisa uno existente."""
+    """Agrega un tenant nuevo al registro. Lanza `ValueError` si el id es inválido
+    (ver `validar_tenant_id`) o ya existe (exacto o por colisión de mayúsculas) —
+    nunca pisa uno existente. Valida acá TAMBIÉN (no sólo en la tool de server.py):
+    este es el punto real de escritura, y confiar sólo en que el caller ya validó es
+    lo que un día deja pasar un id malo por un camino que nadie pensó."""
     actuales = tenants()
-    if any(t.get("id") == tenant_id for t in actuales):
-        raise ValueError(f"El campus '{tenant_id}' ya está registrado.")
+    error = validar_tenant_id(tenant_id, actuales)
+    if error:
+        raise ValueError(error)
     entrada = {"id": tenant_id, "nombre": nombre, "url": url}
     actuales.append(entrada)
     os.makedirs(HOME, exist_ok=True)
@@ -102,41 +146,115 @@ def salidas_dir(tenant_id: str | None = None) -> str:
     return os.path.join(tenant_dir(tenant_id), "salidas")
 
 
+def env_path(tenant_id: str | None = None) -> str:
+    return os.path.join(tenant_dir(tenant_id), ".env")
+
+
+def _leer_env_file(path: str) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not os.path.exists(path):
+        return vals
+    with open(path, encoding="utf-8") as fh:
+        for linea in fh:
+            linea = linea.strip()
+            if linea and not linea.startswith("#") and "=" in linea:
+                k, _, v = linea.partition("=")
+                vals[k.strip()] = v.strip()
+    return vals
+
+
+def leer_env(tenant_id: str | None = None) -> dict[str, str]:
+    """Lee el `.env` de un tenant DIRECTO del archivo — nunca a través de
+    `os.environ`, que es compartido por TODO el proceso y no debe ser la fuente de
+    verdad de las credenciales de un tenant puntual (mezclaría credenciales entre
+    campus tras un `usar_campus`). Fallback: sólo para `tup`, si todavía no tiene su
+    propio `.env` (la migración no corrió o no había nada que migrar), lee el `.env`
+    plano legacy en la raíz de `HOME`."""
+    tid = tenant_id or tenant_activo()
+    vals = _leer_env_file(env_path(tid))
+    if not vals and tid == _TENANT_DEFAULT_ID:
+        vals = _leer_env_file(os.path.join(HOME, ".env"))
+    return vals
+
+
 # --- Migración legacy (flat) -> `HOME/tup/` ---
 # Explícita y llamable sola (para tests contra un HOME temporal) y también invocada una
-# vez al importar server.py. Sólo actúa si hay datos flat de verdad (.env o
-# mis_datos.json en HOME) y es idempotente: si HOME/tup/.env o HOME/tup/mis_datos.json
-# ya existen, no hace nada. NUNCA borra los originales.
+# vez al importar server.py. Sólo actúa si hay datos flat de verdad (.env, mis_datos.json,
+# datos.db o salidas/ en HOME) y es idempotente vía CHEQUEO DE FRESCURA (mtime), no vía
+# "¿ya existe el destino?": si el legacy es más nuevo que la copia por-tenant, se vuelve a
+# copiar (pisa el destino con la versión más nueva) — así un tutor que siguió usando el
+# código single-tenant viejo después de una migración previa no queda con una foto vieja
+# para siempre. NUNCA borra ni toca los originales.
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+
+def _dir_mtime_max(path: str) -> float:
+    """mtime más nuevo entre todos los archivos de un directorio (recursivo), o -1 si
+    no existe/está vacío. Sirve para decidir frescura de `salidas/`, que es un
+    directorio y no tiene un único mtime comparable."""
+    mx = -1.0
+    if not os.path.isdir(path):
+        return mx
+    for raiz, _, archivos in os.walk(path):
+        for f in archivos:
+            mx = max(mx, _mtime(os.path.join(raiz, f)))
+    return mx
+
+
+def _copiar_si_hace_falta(origen: str, destino: str) -> bool:
+    """Copia `origen` -> `destino` si el destino no existe todavía, o si `origen`
+    tiene mtime más nuevo que `destino` (re-migración por uso del código viejo).
+    Nunca copia al revés. Devuelve True si copió algo."""
+    if not os.path.exists(origen):
+        return False
+    if os.path.exists(destino) and _mtime(origen) <= _mtime(destino):
+        return False
+    shutil.copy2(origen, destino)
+    return True
+
 
 def migrar_legacy_a_tup() -> bool:
     """Copia `.env`, `mis_datos.json`, `datos.db` y `salidas/` del layout flat viejo a
-    `HOME/tup/`. Devuelve True si copió algo, False si no había nada que migrar o ya
-    estaba migrado."""
+    `HOME/tup/`, archivo por archivo, sólo los que hagan falta (ausentes o legacy más
+    nuevo). Devuelve True si copió algo, False si no había nada que migrar o el
+    destino ya está al día."""
     env_legacy = os.path.join(HOME, ".env")
     mis_datos_legacy = os.path.join(HOME, "mis_datos.json")
-    if not (os.path.exists(env_legacy) or os.path.exists(mis_datos_legacy)):
-        return False  # instalación nueva, nada que migrar
-
-    destino = tenant_dir(_TENANT_DEFAULT_ID)
-    ya_migrado = os.path.exists(os.path.join(destino, ".env")) or \
-        os.path.exists(os.path.join(destino, "mis_datos.json"))
-    if ya_migrado:
-        return False
-
-    os.makedirs(destino, exist_ok=True)
     db_legacy = os.path.join(HOME, "datos.db")
     salidas_legacy = os.path.join(HOME, "salidas")
 
-    if os.path.exists(env_legacy):
-        shutil.copy2(env_legacy, os.path.join(destino, ".env"))
-    if os.path.exists(mis_datos_legacy):
-        shutil.copy2(mis_datos_legacy, os.path.join(destino, "mis_datos.json"))
-    if os.path.exists(db_legacy):
-        shutil.copy2(db_legacy, os.path.join(destino, "datos.db"))
+    # Dispara también si sólo hay `datos.db`/`salidas/` sin `.env` ni `mis_datos.json`
+    # — un tutor que operó siempre con env vars exportadas a mano (nunca guardó
+    # `mis_datos` por la tool) igual tiene caché/salidas flat que merece migrarse.
+    hay_legacy = (os.path.exists(env_legacy) or os.path.exists(mis_datos_legacy)
+                  or os.path.exists(db_legacy) or os.path.isdir(salidas_legacy))
+    if not hay_legacy:
+        return False  # instalación nueva, nada que migrar
+
+    destino = tenant_dir(_TENANT_DEFAULT_ID)
+    os.makedirs(destino, exist_ok=True)
+    copio_algo = False
+
+    if _copiar_si_hace_falta(env_legacy, os.path.join(destino, ".env")):
+        copio_algo = True
+    if _copiar_si_hace_falta(mis_datos_legacy, os.path.join(destino, "mis_datos.json")):
+        copio_algo = True
+    if _copiar_si_hace_falta(db_legacy, os.path.join(destino, "datos.db")):
+        copio_algo = True
+
     if os.path.isdir(salidas_legacy):
-        shutil.copytree(salidas_legacy, os.path.join(destino, "salidas"),
-                         dirs_exist_ok=True)
-    return True
+        destino_salidas = os.path.join(destino, "salidas")
+        if not os.path.isdir(destino_salidas) or \
+                _dir_mtime_max(salidas_legacy) > _dir_mtime_max(destino_salidas):
+            shutil.copytree(salidas_legacy, destino_salidas, dirs_exist_ok=True)
+            copio_algo = True
+
+    return copio_algo
 
 
 def _conectar(tenant_id: str | None = None) -> sqlite3.Connection:

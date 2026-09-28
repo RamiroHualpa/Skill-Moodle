@@ -117,24 +117,50 @@ class ActiveIAClient:
             return resp
 
 
-# Singleton del módulo, configurado desde ENV VARS (no `config.py`, a diferencia del
-# copiloto). El default de la URL es el mismo que traía el copiloto en su config.
-def _default_client() -> ActiveIAClient:
+# Pool de clientes, UNO POR TENANT (igual que `_clientes` en server.py) — no un
+# singleton de módulo. Antes había un único `_client` global armado una vez desde
+# `os.environ`, así que `activeia_user`/`activeia_pass` pasados a `agregar_campus`
+# para un campus NUEVO quedaban silenciosamente ignorados: el singleton, ya creado
+# para el primer tenant, nunca se reconstruía al conmutar de campus. Ahora cada
+# tenant tiene su propio cliente, leído DIRECTO de su `.env` (vía `almacen.leer_env`,
+# nunca de `os.environ`) — mismo criterio que el cliente Moodle principal.
+_clients: dict[str, ActiveIAClient] = {}
+
+_ACTIVEIA_URL_DEFAULT = "https://api.active-ia.com/api/v1"
+
+
+def _default_client(tenant_id: str | None = None) -> ActiveIAClient:
+    tid = tenant_id or almacen.tenant_activo()
+    vals = almacen.leer_env(tid)
+    if not vals.get("ACTIVEIA_USER") and not vals.get("ACTIVEIA_PASS") \
+            and tid == almacen.tenant_activo():
+        # Legacy: tutor que exportó ACTIVEIA_* a mano (sin pasar por `configurar`/
+        # `agregar_campus`, que las persisten en el `.env` del tenant). Sólo aplica
+        # al tenant ACTIVO — nunca se usa `os.environ` para resolver OTRO tenant.
+        vals = {
+            "ACTIVEIA_URL": os.environ.get("ACTIVEIA_URL", ""),
+            "ACTIVEIA_USER": os.environ.get("ACTIVEIA_USER", ""),
+            "ACTIVEIA_PASS": os.environ.get("ACTIVEIA_PASS", ""),
+        }
     return ActiveIAClient(
-        base_url=os.environ.get("ACTIVEIA_URL", "https://api.active-ia.com/api/v1"),
-        username=os.environ.get("ACTIVEIA_USER", ""),
-        password=os.environ.get("ACTIVEIA_PASS", ""),
+        base_url=vals.get("ACTIVEIA_URL") or _ACTIVEIA_URL_DEFAULT,
+        username=vals.get("ACTIVEIA_USER", ""),
+        password=vals.get("ACTIVEIA_PASS", ""),
     )
 
 
-_client: ActiveIAClient | None = None
+def _get_client(tenant_id: str | None = None) -> ActiveIAClient:
+    tid = tenant_id or almacen.tenant_activo()
+    if tid not in _clients:
+        _clients[tid] = _default_client(tid)
+    return _clients[tid]
 
 
-def _get_client() -> ActiveIAClient:
-    global _client
-    if _client is None:
-        _client = _default_client()
-    return _client
+def invalidar_cliente(tenant_id: str) -> None:
+    """Descarta el cliente Active-IA cacheado de un tenant (para forzar recreación
+    con credenciales nuevas tras `configurar`/`agregar_campus`, o tras un cambio de
+    campus activo que traiga credenciales distintas)."""
+    _clients.pop(tenant_id, None)
 
 
 # ---------- FUNCIÓN 1: pendientes / mapa Moodle↔Active-IA ----------
