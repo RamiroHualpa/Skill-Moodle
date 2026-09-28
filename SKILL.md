@@ -214,6 +214,12 @@ hay que setear variables de entorno a mano).
 **Sin esto, nada funciona.** La skill no puede pedir pendientes ni informes si todavía
 no sabe cuáles son las comisiones del tutor. El orden es obligatorio:
 
+0. **Antes de pedir NADA, mirá qué ya hay.** Llamá `mis_datos`: si el campus activo ya tiene
+   credenciales guardadas (porque se dio de alta con `agregar_campus`/`configurar`, p. ej.
+   desde el asistente), `mis_datos` **detecta solo** las materias y las comisiones que el tutor
+   tiene asignadas y las guarda — no le pidas usuario, contraseña ni nombre. Si más adelante
+   cambió la cohorte, `mapear_mis_datos` rehace ese mapeo con las credenciales ya guardadas.
+   Sólo si una tool falla diciendo que faltan credenciales, seguí con el punto 1.
 1. **Credenciales.** Pedile al tutor su usuario de Moodle (para muchos es el DNI,
    **pero no para todos** — no lo asumas) y su contraseña, y llamá la tool
    `configurar(moodle_user, moodle_pass)`. Esa tool guarda las credenciales en un
@@ -323,6 +329,9 @@ la skill o pisar las credenciales que ya tiene:
    queda ni `.env` ni entrada en `listar_campus`. Con login OK, guarda las
    credenciales (permisos 600) y siembra el catálogo del campus nuevo corriendo
    `descubrir_cursos`/`descubrir_comisiones` automáticamente.
+   Además arma solo su **"Mis datos"**: tus materias, las comisiones que tenés asignadas (los
+   grupos de tipo comisión de los que sos miembro) y las tareas de cada curso — sin pedirte
+   nada más. `mapear_mis_datos` lo rehace cuando quieras (con el campus activo).
 3. **`usar_campus(tenant_id)`** — cambia cuál campus opera TODAS las demás tools (hoy
    ninguna pide un tenant explícito: siempre es "el activo"). Rechaza un `tenant_id`
    no registrado sin tocar el activo — usá `listar_campus` primero si no estás

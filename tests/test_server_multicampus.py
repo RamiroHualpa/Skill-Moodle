@@ -547,5 +547,102 @@ class TestMigracionAutomaticaAlImportar(unittest.TestCase):
         self.assertEqual(r["datos"]["tutor"]["nombre"], "Instalación vieja")
 
 
+class _ClienteFalso:
+    """Un campus: el tutor (userid 7) está en la comisión C4-01 y en una regional."""
+
+    def __init__(self):
+        self.api = type("A", (), {"userid": staticmethod(AsyncMock(return_value=7))})()
+
+    async def ws(self, fn, params=None):
+        if fn == "core_webservice_get_site_info":
+            return {"fullname": "Tutor Prueba", "userid": 7}
+        if fn == "core_group_get_course_user_groups":
+            return {"groups": [{"id": 404, "name": "M25 C4-01"}, {"id": 900, "name": "R-Mendoza"}]}
+        raise AssertionError(fn)
+
+
+class TestMapeoAutomatico(_ConHomeTemporal):
+    def _parchear(self):
+        cursos = [{"course_id": 6, "nombre": "Programación II", "shortname": "P2"},
+                  {"course_id": 9, "nombre": "Otra materia", "shortname": "OM"}]
+        return (patch.object(server, "_cli", return_value=_ClienteFalso()),
+                patch.object(server.ws_api, "descubrir_cursos", new=AsyncMock(return_value=cursos)),
+                patch.object(server.ws_api, "listar_tareas",
+                             new=AsyncMock(return_value=[{"id": "55", "titulo": "TP1", "instanceid": 1}])))
+
+    def test_guarda_solo_mis_comisiones_en_el_tenant_pedido_no_en_el_activo(self):
+        almacen.registrar_tenant("otro", "Otro", "https://otro.example")
+        a, b, c = self._parchear()
+        with a, b, c:
+            r = correr(server._mapear_tenant("otro"))
+        self.assertTrue(r["ok"])
+        datos = json.loads(Path(almacen.mis_datos_path("otro")).read_text(encoding="utf-8"))
+        self.assertEqual(datos["tutor"]["nombre"], "Tutor Prueba")
+        for cur in datos["cursos"]:
+            # la regional R-* no es comisión; y las tareas vienen con el formato de mis_datos
+            self.assertEqual(cur["comisiones_del_tutor"], [{"comision": "M25 C4-01", "group_id": 404}])
+            self.assertEqual(cur["tareas"], [{"assign_id": "55", "titulo": "TP1"}])
+        # el tenant activo (tup) no se tocó
+        self.assertFalse(os.path.exists(almacen.mis_datos_path("tup")))
+
+    def test_conserva_clickup_al_remapear(self):
+        almacen.registrar_tenant("otro", "Otro", "https://otro.example")
+        ruta = Path(almacen.mis_datos_path("otro"))
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_text(json.dumps({"clickup": {"id": "1"}}), encoding="utf-8")
+        a, b, c = self._parchear()
+        with a, b, c:
+            correr(server._mapear_tenant("otro"))
+        self.assertEqual(json.loads(ruta.read_text(encoding="utf-8"))["clickup"], {"id": "1"})
+
+    def test_mis_datos_vacio_con_credenciales_se_mapea_solo(self):
+        almacen.registrar_tenant("otro", "Otro", "https://otro.example")
+        almacen.set_tenant_activo("otro")
+        envp = Path(almacen.tenant_dir("otro")) / ".env"
+        envp.parent.mkdir(parents=True, exist_ok=True)
+        envp.write_text("MOODLE_USER=u\nMOODLE_PASS=p\nMOODLE_URL=https://otro.example\n", encoding="utf-8")
+        a, b, c = self._parchear()
+        with a, b, c, patch.object(server.version, "chequear", new=AsyncMock(return_value={})):
+            r = correr(server.mis_datos())
+        self.assertNotIn("vacio", r)
+        self.assertEqual(r["datos"]["tutor"]["nombre"], "Tutor Prueba")
+
+    def test_mis_datos_vacio_sin_credenciales_sigue_vacio(self):
+        almacen.registrar_tenant("otro", "Otro", "https://otro.example")
+        almacen.set_tenant_activo("otro")
+        # Sin .env propio: nunca se debe intentar mapear (ni pegarle a la red).
+        with patch.object(server, "_credenciales_de", return_value={}),                 patch.object(server, "_mapear_tenant",
+                             new=AsyncMock(side_effect=AssertionError("no debía mapear"))),                 patch.object(server.version, "chequear", new=AsyncMock(return_value={})):
+            r = correr(server.mis_datos())
+        self.assertTrue(r.get("vacio"))
+
+
+class TestComisionesOtraNomenclatura(_ConHomeTemporal):
+    def test_es_comision_reconoce_tup_y_nombres_genericos_pero_no_auxiliares(self):
+        for nombre in ("M25 C4-01", "Comision_6", "Comisión 3", "C2", "1pro1", "2pro5", "1Prog5"):
+            self.assertTrue(server._es_comision(nombre), nombre)
+        for nombre in ("R-Mendoza", "Grupo A", "INACTIVOS", "pro1x", "Rinde_Parcial2_Extra", ""):
+            self.assertFalse(server._es_comision(nombre), nombre)
+
+    def test_docente_sin_grupos_recibe_todas_las_comisiones_del_curso(self):
+        class Cli(_ClienteFalso):
+            async def ws(self, fn, params=None):
+                if fn == "core_group_get_course_user_groups":
+                    return {"groups": []}
+                if fn == "core_group_get_course_groups":
+                    return [{"id": 1, "name": "Comision_6"}, {"id": 2, "name": "Grupo A"},
+                            {"id": 3, "name": "Comision_7"}]
+                return await super().ws(fn, params)
+
+        almacen.registrar_tenant("otro", "Otro", "https://otro.example")
+        cursos = [{"course_id": 3, "nombre": "Prog 1", "shortname": "P1"}]
+        with patch.object(server, "_cli", return_value=Cli()),                 patch.object(server.ws_api, "descubrir_cursos", new=AsyncMock(return_value=cursos)),                 patch.object(server.ws_api, "listar_tareas", new=AsyncMock(return_value=[])):
+            r = correr(server._mapear_tenant("otro"))
+        datos = json.loads(Path(almacen.mis_datos_path("otro")).read_text(encoding="utf-8"))
+        self.assertEqual([c["group_id"] for c in datos["cursos"][0]["comisiones_del_tutor"]], [1, 3])
+        self.assertTrue(datos["cursos"][0]["acceso_total"])
+        self.assertIn("nota", r)
+
+
 if __name__ == "__main__":
     unittest.main()
