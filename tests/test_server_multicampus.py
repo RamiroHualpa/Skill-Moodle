@@ -277,6 +277,120 @@ class TestCredencialesNoSeMezclanEntreTenants(_ConHomeTemporal):
         self.assertEqual(server._credenciales_de("otra"), {})
 
 
+class TestCredencialesDeSinEnvNoHeredaDeOtroTenant(_ConHomeTemporal):
+    """Issue 1, versión chica (repro del reviewer): el tenant ACTIVO no tiene NINGÚN
+    `.env` propio (ej. `tenants.json` editado a mano con una entrada sin archivo —
+    `agregar_campus` normal siempre escribe uno, así que esto sólo pasa con un
+    registro manual/corrupto), pero `os.environ` quedó con las credenciales de OTRO
+    tenant que sí se cargó antes en este mismo proceso (`tup`, vía `_cargar_env` o un
+    `configurar` previo). `_credenciales_de` no debe heredarlas: un tenant sin `.env`
+    propio es "no configurado", no "usá las credenciales de quien sea que haya en
+    memoria"."""
+
+    def _escribir_env_tenant(self, tenant_id: str, extra: dict) -> None:
+        d = Path(almacen.tenant_dir(tenant_id))
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".env").write_text(
+            "".join(f"{k}={v}\n" for k, v in extra.items()), encoding="utf-8")
+
+    def test_tenant_activo_sin_env_propio_no_hereda_de_tup_ya_cargado(self):
+        self._escribir_env_tenant("tup", {
+            "MOODLE_USER": "user-tup", "MOODLE_PASS": "pass-tup",
+            "MOODLE_URL": "https://tup.example",
+        })
+        server._cargar_env()  # simula lo que pasa al importar con tup activo
+
+        # "fantasma": registrado directo (bypass de agregar_campus, que SIEMPRE
+        # escribe un .env) para simular un tenants.json tocado a mano sin su archivo.
+        almacen.registrar_tenant("fantasma", "Fantasma", "https://fantasma.example")
+        correr(server.usar_campus("fantasma"))
+
+        self.assertEqual(server._credenciales_de("fantasma"), {})
+
+    def test_legacy_genuino_sin_ningun_tenant_cargado_sigue_funcionando(self):
+        # Nadie llamó nunca a `_cargar_env`/`_escribir_env` con datos de un tenant
+        # real en este proceso (recién reloadeado en el setUp): el único contenido de
+        # os.environ es lo que un tutor legacy exportó a mano. Ese caso SIGUE
+        # funcionando -- no es lo que este fix restringe.
+        for k in ("MOODLE_USER", "MOODLE_PASS", "MOODLE_URL"):
+            self.addCleanup(TestCredencialesNoSeMezclanEntreTenants._restaurar_env,
+                             k, os.environ.get(k))
+        os.environ["MOODLE_USER"] = "legacy-a-mano"
+        os.environ["MOODLE_PASS"] = "legacy-pass"
+        os.environ["MOODLE_URL"] = "https://legacy.example"
+
+        creds = server._credenciales_de("tup")
+        self.assertEqual(creds.get("MOODLE_USER"), "legacy-a-mano")
+        self.assertEqual(creds.get("MOODLE_PASS"), "legacy-pass")
+
+
+class TestActiveIANoMezclaCredencialesEntreTenants(_ConHomeTemporal):
+    """Issue 1, repro exacto del reviewer: `tup` activo al arrancar el proceso con
+    Active-IA configurado; se agrega "otra" con `.env` PROPIO pero sólo credenciales
+    de Moodle (sin Active-IA, el caso típico de `agregar_campus` sin pasar
+    `activeia_user`/`activeia_pass`); se conmuta a "otra". El cliente de Active-IA de
+    "otra" NO debe armarse con las credenciales de Active-IA de `tup` que quedaron en
+    `os.environ`.
+
+    Antes de este fix, el gate en `active_ia._default_client` era "¿al tenant activo
+    le faltan las claves ACTIVEIA_*?" -- cierto para "otra" aunque tenga su propio
+    `.env` -- así que caía al fallback de `os.environ`, que seguía teniendo las de
+    `tup`. Ahora el gate es "¿el tenant activo no tiene NINGÚN `.env` propio Y
+    `os.environ` no quedó marcado con el de otro tenant?", que da False para "otra"."""
+
+    def _escribir_env_tenant(self, tenant_id: str, extra: dict) -> None:
+        d = Path(almacen.tenant_dir(tenant_id))
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".env").write_text(
+            "".join(f"{k}={v}\n" for k, v in extra.items()), encoding="utf-8")
+
+    def test_tenant_con_env_propio_sin_activeia_no_hereda_del_activo_al_arrancar(self):
+        from moodle import active_ia
+
+        self._escribir_env_tenant("tup", {
+            "MOODLE_USER": "user-tup", "MOODLE_PASS": "pass-tup",
+            "MOODLE_URL": "https://tup.example",
+            "ACTIVEIA_USER": "activeia-tup", "ACTIVEIA_PASS": "activeia-pass-tup",
+        })
+        server._cargar_env()  # tup activo "al arrancar el proceso"
+
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        self._escribir_env_tenant("otra", {
+            "MOODLE_USER": "user-otra", "MOODLE_PASS": "pass-otra",
+            "MOODLE_URL": "https://otra.example",
+            # Sin ACTIVEIA_USER/ACTIVEIA_PASS a propósito.
+        })
+
+        correr(server.usar_campus("otra"))
+
+        cli = active_ia._default_client("otra")
+        self.assertEqual(cli._username, "")
+        self.assertEqual(cli._password, "")
+        self.assertNotEqual(cli._username, "activeia-tup")
+        self.assertNotEqual(cli._password, "activeia-pass-tup")
+
+    def test_tenant_activo_con_su_propio_activeia_lo_usa(self):
+        """Control: un tenant que SÍ tiene sus propias credenciales de Active-IA en
+        su `.env` las usa, sin que este fix las tape."""
+        from moodle import active_ia
+
+        self._escribir_env_tenant("tup", {
+            "MOODLE_USER": "user-tup", "MOODLE_PASS": "pass-tup",
+            "MOODLE_URL": "https://tup.example",
+        })
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        self._escribir_env_tenant("otra", {
+            "MOODLE_USER": "user-otra", "MOODLE_PASS": "pass-otra",
+            "MOODLE_URL": "https://otra.example",
+            "ACTIVEIA_USER": "activeia-otra", "ACTIVEIA_PASS": "activeia-pass-otra",
+        })
+        correr(server.usar_campus("otra"))
+
+        cli = active_ia._default_client("otra")
+        self.assertEqual(cli._username, "activeia-otra")
+        self.assertEqual(cli._password, "activeia-pass-otra")
+
+
 class TestInvalidarClienteConIdVacio(_ConHomeTemporal):
     """Parte de bug #1/#2: `_invalidar_cliente` con un id vacío/inválido no debe
     tocar el cliente cacheado del tenant realmente activo."""

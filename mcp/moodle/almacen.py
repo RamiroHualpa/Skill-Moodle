@@ -177,6 +177,54 @@ def leer_env(tenant_id: str | None = None) -> dict[str, str]:
     return vals
 
 
+def tiene_env(tenant_id: str | None = None) -> bool:
+    """True si el tenant tiene su PROPIO `.env` (existe el archivo, tenga o no las
+    claves que se le pidan). Para `tup` cuenta también el `.env` plano legacy en la
+    raíz de `HOME` (mismo fallback que `leer_env`).
+
+    Distingue dos situaciones que `leer_env` por sí sola no separa: "este tenant
+    todavía no tiene ningún `.env`" (único caso legítimo para mirar `os.environ` como
+    resto legacy de un tutor que exportó variables a mano) de "este tenant SÍ tiene su
+    `.env`, sólo que le faltan campos puntuales" (que debe leerse como 'no
+    configurado', nunca heredar el valor de otro tenant desde `os.environ`)."""
+    tid = tenant_id or tenant_activo()
+    if os.path.exists(env_path(tid)):
+        return True
+    if tid == _TENANT_DEFAULT_ID and os.path.exists(os.path.join(HOME, ".env")):
+        return True
+    return False
+
+
+# --- Qué tenant, si alguno, "contamina" os.environ en este proceso ---
+# `server.py` puebla `os.environ` con el `.env` del tenant activo al importar
+# (`_cargar_env`) y lo vuelve a pisar cada vez que escribe credenciales nuevas
+# (`_escribir_env`). Ese `os.environ` queda VIVO para todo el proceso, así que si el
+# tutor después conmuta a OTRO tenant (`usar_campus`) que no tiene sus propias
+# credenciales, `os.environ` sigue teniendo las del tenant anterior — y un fallback
+# ingenuo a `os.environ` se las presta en silencio. Este flag registra de QUIÉN son
+# los valores que hay ahora mismo en `os.environ`, para que ese fallback sólo se use
+# cuando de verdad es indistinguible del caso legacy genuino (nadie cargó todavía el
+# `.env` de NINGÚN tenant ahí adentro).
+_tenant_en_os_environ: str | None = None
+
+
+def marcar_tenant_en_os_environ(tenant_id: str) -> None:
+    """Registra que `os.environ` fue poblado (o refrescado) con el `.env` propio de
+    `tenant_id`. Llamarlo SÓLO cuando de verdad se acaban de mezclar valores del
+    `.env` de ese tenant puntual a `os.environ` (nunca por las dudas)."""
+    global _tenant_en_os_environ
+    _tenant_en_os_environ = tenant_id
+
+
+def os_environ_es_de(tenant_id: str) -> bool:
+    """True si `os.environ` es una fuente de credenciales segura para `tenant_id`:
+    o bien nunca se cargó ahí el `.env` de NINGÚN tenant en este proceso (caso legacy
+    genuino: tutor que exportó variables a mano y nunca tocó multi-tenant), o el
+    último tenant cuyo `.env` se mezcló ahí es justo éste. Cualquier otro caso
+    significa que `os.environ` tiene puestas las credenciales de OTRO tenant."""
+    return _tenant_en_os_environ in (None, tenant_id)
+
+
 # --- Migración legacy (flat) -> `HOME/tup/` ---
 # Explícita y llamable sola (para tests contra un HOME temporal) y también invocada una
 # vez al importar server.py. Sólo actúa si hay datos flat de verdad (.env, mis_datos.json,

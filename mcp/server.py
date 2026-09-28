@@ -88,6 +88,12 @@ def _cargar_env() -> None:
         vals = _leer_env_archivo(Path(almacen.HOME) / ".env")
     for k, v in vals.items():
         os.environ.setdefault(k, v)
+    if vals:
+        # Sólo si de verdad vinieron valores del `.env` PROPIO de `tid` (no del
+        # hand-export legacy, que no deja archivo): a partir de acá `os.environ`
+        # queda "marcado" como de `tid`, y el fallback legacy de `_credenciales_de`
+        # (y el de `active_ia`) deja de poder usarlo para resolver OTRO tenant.
+        almacen.marcar_tenant_en_os_environ(tid)
 
 
 _cargar_env()
@@ -110,7 +116,12 @@ def _credenciales_de(tenant_id: str) -> dict[str, str]:
     vals = _leer_env_archivo(_env_path(tenant_id))
     if not vals and tenant_id == "tup":
         vals = _leer_env_archivo(Path(almacen.HOME) / ".env")
-    if not vals and tenant_id == almacen.tenant_activo():
+    if (not vals and tenant_id == almacen.tenant_activo()
+            and almacen.os_environ_es_de(tenant_id)):
+        # `os.environ` sólo es fuente válida acá si nunca se cargó ahí el `.env` de
+        # OTRO tenant en este proceso (`os_environ_es_de`) — si no, un tutor que
+        # conmutó de campus con `usar_campus` a un tenant sin `.env` propio heredaría
+        # en silencio las credenciales del que estaba activo al arrancar el proceso.
         legacy = {
             "MOODLE_URL": os.environ.get("MOODLE_URL", ""),
             "MOODLE_USER": os.environ.get("MOODLE_USER", ""),
@@ -176,6 +187,7 @@ def _escribir_env(vals: dict[str, str], tenant_id: str | None = None) -> None:
     if tid == almacen.tenant_activo():
         for k, v in existentes.items():
             os.environ[k] = v  # disponibles ya en esta sesión
+        almacen.marcar_tenant_en_os_environ(tid)
 
 
 async def _configurar_credenciales(

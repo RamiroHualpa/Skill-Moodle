@@ -132,11 +132,23 @@ _ACTIVEIA_URL_DEFAULT = "https://api.active-ia.com/api/v1"
 def _default_client(tenant_id: str | None = None) -> ActiveIAClient:
     tid = tenant_id or almacen.tenant_activo()
     vals = almacen.leer_env(tid)
-    if not vals.get("ACTIVEIA_USER") and not vals.get("ACTIVEIA_PASS") \
-            and tid == almacen.tenant_activo():
-        # Legacy: tutor que exportó ACTIVEIA_* a mano (sin pasar por `configurar`/
-        # `agregar_campus`, que las persisten en el `.env` del tenant). Sólo aplica
-        # al tenant ACTIVO — nunca se usa `os.environ` para resolver OTRO tenant.
+    if (not almacen.tiene_env(tid) and tid == almacen.tenant_activo()
+            and almacen.os_environ_es_de(tid)):
+        # Legacy genuino: tutor que exportó ACTIVEIA_* a mano (sin pasar por
+        # `configurar`/`agregar_campus`, que las persisten en el `.env` del tenant) —
+        # `tid` no tiene NINGÚN `.env` propio todavía. Antes el gate era "le faltan
+        # las claves ACTIVEIA_*" (`vals.get(...)` vacío), así que un tenant con `.env`
+        # PROPIO pero sólo credenciales de Moodle (sin Active-IA) también entraba acá
+        # y se armaba con lo que hubiera en `os.environ` — que, tras un `usar_campus`,
+        # son las credenciales de Active-IA de OTRO tenant (el que estaba activo al
+        # arrancar el proceso). Confirmado por el reviewer: tup con Active-IA
+        # configurado, se agrega "otra" sin credenciales de Active-IA, se conmuta a
+        # "otra" con `usar_campus` y las llamadas de Active-IA salían con la cuenta de
+        # tup. Ahora sólo se mira `os.environ` si `tid` NO tiene `.env` en absoluto
+        # (`tiene_env`) Y `os.environ` no quedó marcado con el de otro tenant
+        # (`os_environ_es_de`) — un tenant con `.env` propio sin claves de Active-IA
+        # queda simplemente sin cliente configurado, igual que si nunca hubiera
+        # existido `os.environ`.
         vals = {
             "ACTIVEIA_URL": os.environ.get("ACTIVEIA_URL", ""),
             "ACTIVEIA_USER": os.environ.get("ACTIVEIA_USER", ""),

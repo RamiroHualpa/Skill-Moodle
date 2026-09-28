@@ -177,8 +177,11 @@ class TestMigracionLegacy(_ConHomeTemporal):
 
         # El tutor sigue usando el código single-tenant viejo: escribe en el .env
         # plano de nuevo, con contenido DISTINTO y mtime más nuevo que la copia.
+        # 1.1s y no 0.01s: algunos filesystems (ej. HFS+/exFAT, y FAT en Windows)
+        # sólo resuelven el mtime al segundo, así que un sleep de 10ms puede dejar
+        # ambos archivos con el MISMO mtime reportado y el test se vuelve flaky.
         import time
-        time.sleep(0.01)
+        time.sleep(1.1)
         (home / ".env").write_text("MOODLE_USER=actualizado-post-migracion\n",
                                     encoding="utf-8")
 
