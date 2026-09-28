@@ -17,24 +17,132 @@ import asyncio
 import datetime
 import json
 import os
+import shutil
 import sqlite3
 from typing import Any
 
-# Raíz de datos de la Skill. Configurable por env para no clavarla en $HOME (tests, CI).
+# Raíz de datos de la Skill (MÁQUINA/skill-wide, no por-campus). Configurable por env
+# para no clavarla en $HOME (tests, CI). Acá viven `tenants.json`, `estado.json`, los
+# datos LEGACY sin tenant (migración, nunca se borran) y el cache de version.py — todo
+# lo demás vive bajo `HOME/<tenant_id>/`.
 HOME = os.path.expanduser(os.environ.get("MOODLE_SKILL_HOME", "~/.moodle-skill"))
-DB_PATH = os.path.join(HOME, "datos.db")
-MIS_DATOS_PATH = os.path.join(HOME, "mis_datos.json")
-# Directorio de salidas (informes PDF, entregas bajadas).
-SALIDAS_DIR = os.path.join(HOME, "salidas")
+
+_TENANT_DEFAULT_ID = "tup"
+_TENANT_DEFAULT_URL = "https://tup.sied.utn.edu.ar"
+_ESTADO_PATH = os.path.join(HOME, "estado.json")
+_TENANTS_PATH = os.path.join(HOME, "tenants.json")
 
 
 def _ahora() -> str:
     return datetime.datetime.now().isoformat()
 
 
-def _conectar() -> sqlite3.Connection:
+# --- Identidad del tenant (campus) activo ---
+# Lectura con default gracioso y SIN escritura: un `tenant_activo()` en una instalación
+# nueva no debe crear nada — sólo `set_tenant_activo` escribe.
+
+def tenant_activo() -> str:
+    """Id del tenant/campus activo. Default `"tup"` si `estado.json` no existe."""
+    try:
+        with open(_ESTADO_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        tid = data.get("tenant_activo")
+        return tid or _TENANT_DEFAULT_ID
+    except (FileNotFoundError, ValueError):
+        return _TENANT_DEFAULT_ID
+
+
+def set_tenant_activo(tenant_id: str) -> None:
+    """Marca `tenant_id` como el campus activo (persistido en `estado.json`)."""
     os.makedirs(HOME, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    with open(_ESTADO_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"tenant_activo": tenant_id}, fh, ensure_ascii=False, indent=2)
+
+
+def tenants() -> list[dict]:
+    """Campus registrados. Default: sólo `tup` si `tenants.json` no existe (no escribe)."""
+    try:
+        with open(_TENANTS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, ValueError):
+        return [{"id": _TENANT_DEFAULT_ID, "nombre": "TUP (UTN)", "url": _TENANT_DEFAULT_URL}]
+
+
+def registrar_tenant(tenant_id: str, nombre: str, url: str) -> dict:
+    """Agrega un tenant nuevo al registro. Lanza `ValueError` si el id ya existe —
+    nunca pisa uno existente."""
+    actuales = tenants()
+    if any(t.get("id") == tenant_id for t in actuales):
+        raise ValueError(f"El campus '{tenant_id}' ya está registrado.")
+    entrada = {"id": tenant_id, "nombre": nombre, "url": url}
+    actuales.append(entrada)
+    os.makedirs(HOME, exist_ok=True)
+    with open(_TENANTS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(actuales, fh, ensure_ascii=False, indent=2)
+    return entrada
+
+
+# --- Paths por tenant ---
+
+def tenant_dir(tenant_id: str | None = None) -> str:
+    """Directorio de datos del tenant (o del activo si no se pasa uno)."""
+    return os.path.join(HOME, tenant_id or tenant_activo())
+
+
+def db_path(tenant_id: str | None = None) -> str:
+    return os.path.join(tenant_dir(tenant_id), "datos.db")
+
+
+def mis_datos_path(tenant_id: str | None = None) -> str:
+    return os.path.join(tenant_dir(tenant_id), "mis_datos.json")
+
+
+def salidas_dir(tenant_id: str | None = None) -> str:
+    return os.path.join(tenant_dir(tenant_id), "salidas")
+
+
+# --- Migración legacy (flat) -> `HOME/tup/` ---
+# Explícita y llamable sola (para tests contra un HOME temporal) y también invocada una
+# vez al importar server.py. Sólo actúa si hay datos flat de verdad (.env o
+# mis_datos.json en HOME) y es idempotente: si HOME/tup/.env o HOME/tup/mis_datos.json
+# ya existen, no hace nada. NUNCA borra los originales.
+
+def migrar_legacy_a_tup() -> bool:
+    """Copia `.env`, `mis_datos.json`, `datos.db` y `salidas/` del layout flat viejo a
+    `HOME/tup/`. Devuelve True si copió algo, False si no había nada que migrar o ya
+    estaba migrado."""
+    env_legacy = os.path.join(HOME, ".env")
+    mis_datos_legacy = os.path.join(HOME, "mis_datos.json")
+    if not (os.path.exists(env_legacy) or os.path.exists(mis_datos_legacy)):
+        return False  # instalación nueva, nada que migrar
+
+    destino = tenant_dir(_TENANT_DEFAULT_ID)
+    ya_migrado = os.path.exists(os.path.join(destino, ".env")) or \
+        os.path.exists(os.path.join(destino, "mis_datos.json"))
+    if ya_migrado:
+        return False
+
+    os.makedirs(destino, exist_ok=True)
+    db_legacy = os.path.join(HOME, "datos.db")
+    salidas_legacy = os.path.join(HOME, "salidas")
+
+    if os.path.exists(env_legacy):
+        shutil.copy2(env_legacy, os.path.join(destino, ".env"))
+    if os.path.exists(mis_datos_legacy):
+        shutil.copy2(mis_datos_legacy, os.path.join(destino, "mis_datos.json"))
+    if os.path.exists(db_legacy):
+        shutil.copy2(db_legacy, os.path.join(destino, "datos.db"))
+    if os.path.isdir(salidas_legacy):
+        shutil.copytree(salidas_legacy, os.path.join(destino, "salidas"),
+                         dirs_exist_ok=True)
+    return True
+
+
+def _conectar(tenant_id: str | None = None) -> sqlite3.Connection:
+    d = tenant_dir(tenant_id)
+    os.makedirs(d, exist_ok=True)
+    con = sqlite3.connect(db_path(tenant_id))
     con.row_factory = sqlite3.Row
     return con
 
@@ -124,7 +232,7 @@ CREATE INDEX IF NOT EXISTS idx_correcciones_curso ON correcciones(course_id);
 
 
 def _init_db() -> None:
-    os.makedirs(SALIDAS_DIR, exist_ok=True)
+    os.makedirs(salidas_dir(), exist_ok=True)
     con = _conectar()
     try:
         con.executescript(_SCHEMA)
@@ -142,7 +250,7 @@ async def init_db() -> None:
 
 def _get_mis_datos() -> dict | None:
     try:
-        with open(MIS_DATOS_PATH, encoding="utf-8") as fh:
+        with open(mis_datos_path(), encoding="utf-8") as fh:
             return json.load(fh)
     except (FileNotFoundError, ValueError):
         return None
@@ -153,8 +261,8 @@ async def get_mis_datos() -> dict | None:
 
 
 def _set_mis_datos(datos: dict) -> None:
-    os.makedirs(HOME, exist_ok=True)
-    with open(MIS_DATOS_PATH, "w", encoding="utf-8") as fh:
+    os.makedirs(tenant_dir(), exist_ok=True)
+    with open(mis_datos_path(), "w", encoding="utf-8") as fh:
         json.dump(datos, fh, ensure_ascii=False, indent=2)
 
 
@@ -166,7 +274,7 @@ async def mis_datos_actualizada() -> str | None:
     """mtime del mis_datos.json (ISO), o None si no existe."""
     def _stat() -> str | None:
         try:
-            ts = os.path.getmtime(MIS_DATOS_PATH)
+            ts = os.path.getmtime(mis_datos_path())
         except OSError:
             return None
         return datetime.datetime.fromtimestamp(ts).isoformat()

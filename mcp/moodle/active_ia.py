@@ -34,7 +34,7 @@ from pathlib import Path
 import httpx
 
 from . import ws_api
-from .almacen import SALIDAS_DIR
+from . import almacen
 from .cliente import MobileWSClient
 
 # ---------- Constantes ----------
@@ -644,12 +644,12 @@ async def exportar_devolucion_pdf(
 
     GET /documentos/correcciones/{correccion_id}/pdf con el JWT (mismo cliente que ya
     tiene el token cacheado) y guarda el archivo en `dest_dir`. Por default va al
-    `salidas/` de la Skill (`$MOODLE_SKILL_HOME/salidas`, = `almacen.SALIDAS_DIR`), el
-    mismo lugar donde `armar_informe` deja sus PDFs.
+    `salidas/` del tenant activo de la Skill (`almacen.salidas_dir()`), el mismo lugar
+    donde `armar_informe` deja sus PDFs.
 
     Devuelve `{ok, path, bytes}` con la ruta absoluta del PDF descargado, o `{error}`
     (nunca lanza)."""
-    destino = dest_dir or SALIDAS_DIR
+    destino = dest_dir or almacen.salidas_dir()
     try:
         resp = await cli_activeia.request(
             "GET", f"/documentos/correcciones/{correccion_id}/pdf", timeout=_PDF_TIMEOUT_S

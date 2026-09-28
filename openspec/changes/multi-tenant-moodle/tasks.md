@@ -1,18 +1,18 @@
 ## 1. Tenant storage foundation (`mcp/moodle/almacen.py`)
 
-- [ ] 1.1 Add `tenant_dir(tenant_id=None)`, `mis_datos_path()`, `db_path()`,
+- [x] 1.1 Add `tenant_dir(tenant_id=None)`, `mis_datos_path()`, `db_path()`,
       `salidas_dir()` functions replacing the `HOME`/`DB_PATH`/`MIS_DATOS_PATH`/
       `SALIDAS_DIR` module constants; verify by importing the module and calling each
       with an explicit tenant id and with none (falling back to active tenant).
-- [ ] 1.2 Add `tenant_activo()` / `set_tenant_activo(tenant_id)` reading/writing
+- [x] 1.2 Add `tenant_activo()` / `set_tenant_activo(tenant_id)` reading/writing
       `~/.moodle-skill/estado.json`, defaulting to `"tup"` when the file is absent;
       verify with a unit test that a fresh temp `HOME` returns `"tup"` and that
       `set_tenant_activo` persists across a fresh read.
-- [ ] 1.3 Add `tenants()` / `registrar_tenant(id, nombre, url)` reading/writing
+- [x] 1.3 Add `tenants()` / `registrar_tenant(id, nombre, url)` reading/writing
       `~/.moodle-skill/tenants.json`, defaulting to `[{"id": "tup", ...}]` when
       absent, and rejecting `registrar_tenant` for a duplicate id (raises, does not
       overwrite); verify with a unit test covering the duplicate-id rejection.
-- [ ] 1.4 Add the idempotent flat-to-`tup/` migration (copies `.env`,
+- [x] 1.4 Add the idempotent flat-to-`tup/` migration (copies `.env`,
       `mis_datos.json`, `datos.db`, `salidas/` from the old flat `~/.moodle-skill/`
       into `~/.moodle-skill/tup/` if the new path doesn't exist yet; never deletes
       the originals); verify with a unit test using a temp dir seeded with old-layout
