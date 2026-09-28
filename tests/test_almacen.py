@@ -78,6 +78,44 @@ class TestRegistrarTenant(_ConHomeTemporal):
         self.assertEqual(entradas[0]["nombre"], "Foo Campus")
 
 
+class TestValidarTenantId(_ConHomeTemporal):
+    """Bug #2 del review: un `tenant_id` sin validar permite colisión de mayúsculas
+    (grave en Windows, filesystem case-insensitive) y path traversal. `tup` ya está
+    registrado por default en toda instalación nueva, así que sirve para probar la
+    colisión de mayúsculas sin tener que registrar nada primero."""
+
+    def test_rechaza_colision_de_mayusculas_con_tup(self):
+        self.assertIsNotNone(almacen.validar_tenant_id("TUP"))
+        self.assertIsNotNone(almacen.validar_tenant_id("Tup"))
+
+    def test_rechaza_vacio_punto_y_puntopunto(self):
+        for malo in ("", ".", ".."):
+            with self.subTest(malo=malo):
+                self.assertIsNotNone(almacen.validar_tenant_id(malo))
+
+    def test_rechaza_path_traversal(self):
+        self.assertIsNotNone(almacen.validar_tenant_id("../escape"))
+
+    def test_acepta_id_normal(self):
+        self.assertIsNone(almacen.validar_tenant_id("otra-facu"))
+
+    def test_registrar_tenant_rechaza_colision_de_mayusculas(self):
+        almacen.registrar_tenant("foo", "Foo Campus", "https://foo.example")
+        with self.assertRaises(ValueError):
+            almacen.registrar_tenant("FOO", "Otro Foo", "https://otro.example")
+        # No se creó ni duplicó nada: sigue habiendo un único "foo".
+        ids = [t["id"] for t in almacen.tenants()]
+        self.assertEqual(ids.count("foo"), 1)
+        self.assertNotIn("FOO", ids)
+
+    def test_registrar_tenant_rechaza_path_traversal(self):
+        with self.assertRaises(ValueError):
+            almacen.registrar_tenant("../escape", "Escape", "https://x.example")
+        # No se escribió nada fuera de HOME.
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.dirname(self._tmp.name), "escape")))
+
+
 class TestMigracionLegacy(_ConHomeTemporal):
     def _sembrar_layout_viejo(self):
         home = self._tmp.name
@@ -124,6 +162,41 @@ class TestMigracionLegacy(_ConHomeTemporal):
         self.assertEqual(destino_env.read_text(encoding="utf-8"),
                           "MOODLE_USER=nuevo-post-migracion\n")
 
+    def test_legacy_mas_nuevo_que_la_copia_se_re_migra(self):
+        """Bug #3 del review: si alguien sigue usando el código viejo single-tenant
+        DESPUÉS de una migración previa (escribe en el `.env` plano), una corrida
+        posterior de la migración tiene que traer eso — no quedarse con la foto vieja
+        para siempre sólo porque `tup/.env` ya "existe"."""
+        self._sembrar_layout_viejo()
+        self.assertTrue(almacen.migrar_legacy_a_tup())
+
+        home = Path(self._tmp.name)
+        destino_env = home / "tup" / ".env"
+        contenido_viejo = destino_env.read_text(encoding="utf-8")
+        self.assertEqual(contenido_viejo, "MOODLE_USER=viejo\n")
+
+        # El tutor sigue usando el código single-tenant viejo: escribe en el .env
+        # plano de nuevo, con contenido DISTINTO y mtime más nuevo que la copia.
+        import time
+        time.sleep(0.01)
+        (home / ".env").write_text("MOODLE_USER=actualizado-post-migracion\n",
+                                    encoding="utf-8")
+
+        self.assertTrue(almacen.migrar_legacy_a_tup())
+        self.assertEqual(destino_env.read_text(encoding="utf-8"),
+                          "MOODLE_USER=actualizado-post-migracion\n")
+
+    def test_dispara_con_solo_datos_db_sin_env_ni_mis_datos(self):
+        """Un tutor que sólo usó env vars exportadas a mano (nunca `configurar`, nunca
+        `guardar_mis_datos`) puede igual tener `datos.db`/`salidas/` flat de la
+        cátedra vieja — la migración tiene que alcanzarlo también, no sólo a quien
+        tiene `.env`/`mis_datos.json`."""
+        home = Path(self._tmp.name)
+        (home / "datos.db").write_bytes(b"solo-db-sin-env-ni-mis-datos")
+        self.assertTrue(almacen.migrar_legacy_a_tup())
+        self.assertEqual(Path(home, "tup", "datos.db").read_bytes(),
+                          b"solo-db-sin-env-ni-mis-datos")
+
 
 class TestPathsPorTenant(_ConHomeTemporal):
     def test_paths_explicitos_vs_default_al_activo(self):
@@ -136,6 +209,64 @@ class TestPathsPorTenant(_ConHomeTemporal):
         self.assertEqual(almacen.mis_datos_path("foo"),
                           os.path.join(home, "foo", "mis_datos.json"))
         self.assertEqual(almacen.salidas_dir("foo"), os.path.join(home, "foo", "salidas"))
+
+
+class TestActiveIAPoolPorTenant(_ConHomeTemporal):
+    """Bug #1 del review (tercera instancia): `active_ia` tenía un singleton de
+    módulo armado UNA vez desde `os.environ`, así que `activeia_user`/
+    `activeia_pass` pasados a `agregar_campus` para un campus NUEVO quedaban
+    ignorados en silencio tras un `usar_campus` (el singleton ya existía). Ahora es
+    un pool por tenant, igual que el cliente Moodle principal — cada tenant lee sus
+    propias credenciales ACTIVEIA_* directo de SU `.env`."""
+
+    def setUp(self):
+        super().setUp()
+        # `active_ia` no se recarga por test (a diferencia de `almacen`): su pool
+        # `_clients` es de módulo y sobreviviría entre tests con HOMEs temporales
+        # distintos, devolviendo un cliente cacheado de un test anterior en vez de
+        # leer el `.env` del HOME de ESTE test. Se limpia a mano acá.
+        from moodle import active_ia
+        active_ia._clients.clear()
+
+    def test_cada_tenant_tiene_su_propio_cliente_activeia(self):
+        from moodle import active_ia
+
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        Path(almacen.tenant_dir("tup")).mkdir(parents=True, exist_ok=True)
+        Path(almacen.tenant_dir("tup"), ".env").write_text(
+            "ACTIVEIA_USER=user-tup\nACTIVEIA_PASS=pass-tup\n", encoding="utf-8")
+        Path(almacen.tenant_dir("otra")).mkdir(parents=True, exist_ok=True)
+        Path(almacen.tenant_dir("otra"), ".env").write_text(
+            "ACTIVEIA_USER=user-otra\nACTIVEIA_PASS=pass-otra\n", encoding="utf-8")
+
+        cli_tup = active_ia._get_client("tup")
+        cli_otra = active_ia._get_client("otra")
+        self.assertEqual(cli_tup._username, "user-tup")
+        self.assertEqual(cli_otra._username, "user-otra")
+        self.assertNotEqual(cli_tup._username, cli_otra._username)
+
+        # Y son cacheados por tenant: pedir el mismo tenant de nuevo da el MISMO
+        # objeto (no se reconstruye ni se mezcla).
+        self.assertIs(active_ia._get_client("tup"), cli_tup)
+
+    def test_invalidar_cliente_fuerza_reconstruccion_con_credenciales_nuevas(self):
+        from moodle import active_ia
+
+        Path(almacen.tenant_dir("tup")).mkdir(parents=True, exist_ok=True)
+        env_tup = Path(almacen.tenant_dir("tup"), ".env")
+        env_tup.write_text("ACTIVEIA_USER=viejo\nACTIVEIA_PASS=viejo\n", encoding="utf-8")
+
+        cli_viejo = active_ia._get_client("tup")
+        self.assertEqual(cli_viejo._username, "viejo")
+
+        env_tup.write_text("ACTIVEIA_USER=nuevo\nACTIVEIA_PASS=nuevo\n", encoding="utf-8")
+        # Sin invalidar, sigue cacheado el viejo.
+        self.assertIs(active_ia._get_client("tup"), cli_viejo)
+
+        active_ia.invalidar_cliente("tup")
+        cli_nuevo = active_ia._get_client("tup")
+        self.assertEqual(cli_nuevo._username, "nuevo")
+        self.assertIsNot(cli_nuevo, cli_viejo)
 
 
 if __name__ == "__main__":

@@ -12,13 +12,24 @@ Correr:  .venv/bin/python -m unittest discover -s tests -v
 """
 
 import asyncio
+import atexit
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAIZ / "mcp"))
+
+# IMPORTANTE — orden de import: `server.py` corre `almacen.migrar_legacy_a_tup()` al
+# importarse (side-effect de módulo). Sin fijar `MOODLE_SKILL_HOME` a un temp ANTES de
+# este `import server`, la migración automática corre contra el `~/.moodle-skill` REAL
+# de quien corre los tests (ver el mismo fix en tests/test_server_multicampus.py).
+_HOME_IMPORT_TMP = tempfile.TemporaryDirectory()
+os.environ.setdefault("MOODLE_SKILL_HOME", _HOME_IMPORT_TMP.name)
+atexit.register(_HOME_IMPORT_TMP.cleanup)
 
 import server  # noqa: E402
 

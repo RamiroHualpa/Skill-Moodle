@@ -11,6 +11,7 @@ SÍ leen archivos reales del repo (`mcp/aprendizajes.json`) a propósito; estos 
 Correr:  python -m unittest discover -s tests -v
 """
 
+import atexit
 import importlib
 import json
 import os
@@ -21,6 +22,18 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp"))
+
+# IMPORTANTE — orden de import: `server.py` corre `almacen.migrar_legacy_a_tup()` como
+# side-effect AL IMPORTAR (ver su docstring de módulo). Si `MOODLE_SKILL_HOME` no está
+# seteado ANTES de este `import server`, la migración automática corre contra el
+# `~/.moodle-skill` REAL de quien ejecuta los tests — esto pasó de verdad en una máquina
+# de desarrollo (inofensivo: la migración sólo COPIA y se verificó byte-idéntica, pero no
+# debe volver a pasar). Por eso se fija un home temporal de MÓDULO acá, ANTES del import,
+# separado del home temporal por-test de `_ConHomeTemporal` (que sigue existiendo para
+# aislar cada test entre sí vía `importlib.reload`).
+_HOME_IMPORT_TMP = tempfile.TemporaryDirectory()
+os.environ["MOODLE_SKILL_HOME"] = _HOME_IMPORT_TMP.name
+atexit.register(_HOME_IMPORT_TMP.cleanup)
 
 from moodle import almacen  # noqa: E402
 import server  # noqa: E402
@@ -191,6 +204,198 @@ class TestAislamientoEntreTenants(_ConHomeTemporal):
         self.assertNotEqual(p_tup, p_otra)
         self.assertIn(os.path.join("tup", ".auth"), p_tup)
         self.assertIn(os.path.join("otra", ".auth"), p_otra)
+
+
+class TestCredencialesNoSeMezclanEntreTenants(_ConHomeTemporal):
+    """Bug #1 del review (CRÍTICO), repro exacto: dos tenants con sus propios `.env`
+    en disco, y `os.environ` ya "contaminado" con las credenciales del PRIMERO (tal
+    cual queda tras `_cargar_env()` al importar, o tras un `configurar` previo en el
+    mismo proceso). Antes, `_credenciales_de()` para el tenant ACTIVO leía de
+    `os.environ` con `setdefault`, así que el segundo tenant terminaba logueándose
+    con las credenciales del primero. Ahora cada `_cli(tenant)` tiene que armarse con
+    SUS PROPIAS credenciales, leídas directo de SU `.env`, sin importar qué haya en
+    `os.environ`."""
+
+    @staticmethod
+    def _restaurar_env(k: str, valor_previo: str | None) -> None:
+        if valor_previo is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = valor_previo
+
+    def _escribir_env_tenant(self, tenant_id: str, usuario: str, password: str,
+                             url: str) -> None:
+        d = Path(almacen.tenant_dir(tenant_id))
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".env").write_text(
+            f"MOODLE_USER={usuario}\nMOODLE_PASS={password}\nMOODLE_URL={url}\n",
+            encoding="utf-8")
+
+    def test_dos_tenants_en_el_mismo_proceso_usan_cada_uno_sus_propias_credenciales(self):
+        self._escribir_env_tenant("tup", "user-tup", "pass-tup", "https://tup.example")
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        self._escribir_env_tenant("otra", "user-otra", "pass-otra", "https://otra.example")
+
+        # Repro del bug real: os.environ ya viene "contaminado" con credenciales de
+        # OTRO tenant/proceso (deliberadamente distintas de "tup" Y de "otra", para
+        # que cualquier lectura vía os.environ sea detectable) ANTES de pedir un
+        # cliente para cualquiera de los dos.
+        for k in ("MOODLE_USER", "MOODLE_PASS", "MOODLE_URL"):
+            self.addCleanup(self._restaurar_env, k, os.environ.get(k))
+        os.environ["MOODLE_USER"] = "contaminado"
+        os.environ["MOODLE_PASS"] = "contaminado"
+        os.environ["MOODLE_URL"] = "https://contaminado.example"
+
+        cli_tup = server._cli("tup")
+        self.assertEqual(cli_tup._dni, "user-tup")
+        self.assertEqual(cli_tup._password, "pass-tup")
+
+        # Conmutar y pedir el cliente de "otra" sin invalidar nada a mano: tiene que
+        # traer SUS credenciales, no las de "tup" que siguen pisadas en os.environ.
+        correr(server.usar_campus("otra"))
+        cli_otra = server._cli("otra")
+        self.assertEqual(cli_otra._dni, "user-otra")
+        self.assertEqual(cli_otra._password, "pass-otra")
+
+        # Y volver a "tup" (con "otra" ya activo, os.environ sigue diciendo "tup" del
+        # primer _cargar_env — el fallback legacy no debe interferir) sigue dando las
+        # credenciales correctas de "tup", cacheadas o no.
+        correr(server.usar_campus("tup"))
+        cli_tup_de_nuevo = server._cli("tup")
+        self.assertEqual(cli_tup_de_nuevo._dni, "user-tup")
+        self.assertEqual(cli_tup_de_nuevo._password, "pass-tup")
+
+    def test_credenciales_de_no_lee_os_environ_para_un_tenant_que_no_es_el_activo(self):
+        self._escribir_env_tenant("tup", "user-tup", "pass-tup", "https://tup.example")
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        # "otra" NO tiene .env propio todavía (nunca se configuró). os.environ tiene
+        # las credenciales de "tup" (el activo). Pedir credenciales de "otra" -que NO
+        # es el activo- no debe devolver las de os.environ (las de tup) — antes de
+        # este fix habría heredado tup por el fallback si no se filtraba por tenant
+        # activo; ahora tiene que quedar vacío.
+        server._cargar_env()
+        self.assertEqual(server._credenciales_de("otra"), {})
+
+
+class TestInvalidarClienteConIdVacio(_ConHomeTemporal):
+    """Parte de bug #1/#2: `_invalidar_cliente` con un id vacío/inválido no debe
+    tocar el cliente cacheado del tenant realmente activo."""
+
+    def test_invalidar_con_id_vacio_no_afecta_al_activo(self):
+        server._clientes["tup"] = object()
+        marca = server._clientes["tup"]
+        server._invalidar_cliente("")
+        self.assertIs(server._clientes.get("tup"), marca)
+
+
+class TestAgregarCampusValidaTenantId(_ConHomeTemporal):
+    """Bug #2 del review (CRÍTICO): `agregar_campus` tiene que rechazar un
+    `tenant_id` inválido ANTES de tocar la red o el disco — colisión de mayúsculas
+    (grave en Windows, filesystem case-insensitive), vacío, `.`, `..` y path
+    traversal."""
+
+    def _agregar(self, tenant_id: str):
+        with patch.object(server.ws_api, "descubrir_cursos",
+                          new=AsyncMock(side_effect=AssertionError(
+                              "no debía intentar loguearse con un tenant_id inválido"))):
+            return correr(server.agregar_campus(
+                tenant_id=tenant_id, nombre="X", url="https://x.example",
+                moodle_user="u", moodle_pass="p"))
+
+    def test_rechaza_colision_de_mayusculas_con_tup(self):
+        r = self._agregar("TUP")
+        self.assertFalse(r["ok"])
+        self.assertNotIn("TUP", [t["id"] for t in almacen.tenants()])
+
+    def test_rechaza_vacio(self):
+        r = self._agregar("")
+        self.assertFalse(r["ok"])
+
+    def test_rechaza_punto(self):
+        r = self._agregar(".")
+        self.assertFalse(r["ok"])
+
+    def test_rechaza_puntopunto(self):
+        r = self._agregar("..")
+        self.assertFalse(r["ok"])
+
+    def test_rechaza_path_traversal(self):
+        r = self._agregar("../escape")
+        self.assertFalse(r["ok"])
+        # No se escribió nada fuera de HOME.
+        fuera = Path(almacen.HOME).parent / "escape"
+        self.assertFalse(fuera.exists())
+
+    def test_acepta_id_normal_con_login_ok(self):
+        with patch.object(server.ws_api, "descubrir_cursos",
+                          new=AsyncMock(return_value=[{"course_id": 1, "nombre": "X"}])), \
+             patch.object(server.ws_api, "descubrir_comisiones",
+                          new=AsyncMock(return_value=[])):
+            r = correr(server.agregar_campus(
+                tenant_id="otra-facu", nombre="Otra Facu", url="https://otra.example",
+                moodle_user="u", moodle_pass="p"))
+        self.assertTrue(r["ok"])
+        self.assertIn("otra-facu", [t["id"] for t in almacen.tenants()])
+
+
+class TestSeedDeCatalogoYMiComision(_ConHomeTemporal):
+    """Bug #5 del review: el catálogo sembrado por `agregar_campus` tiene que traer
+    `cohorte`/`vigente_hasta` (si no, `aulas()` siempre avisa "venció"), y una
+    comisión sin `tutor` (recién descubierta, sin reparto todavía) no puede tirar
+    `mi_comision()` abajo."""
+
+    def test_mi_comision_no_crashea_con_comision_sin_tutor(self):
+        almacen.registrar_tenant("otra", "Otra", "https://otra.example")
+        correr(server.usar_campus("otra"))
+        propio = Path(almacen.tenant_dir("otra")) / "comisiones.json"
+        propio.parent.mkdir(parents=True, exist_ok=True)
+        propio.write_text(json.dumps({
+            "cohorte": "Descubierto 2026-09-28",
+            "materias": [{
+                "materia": "Programación I", "course_id": 1,
+                "comisiones": [
+                    {"comision": "A26 C1-01", "nombre_campus": "A26 C1-01",
+                     "group_id": 123},
+                ],
+            }],
+        }), encoding="utf-8")
+        # No debe tirar KeyError: 'tutor' — antes de este fix, esto rompía.
+        r = correr(server.mi_comision("cualquiera"))
+        self.assertTrue(r.get("sin_resultado"))
+        self.assertEqual(r["tutores_del_catalogo"], [])
+
+    def test_catalogo_sembrado_por_agregar_campus_trae_vigente_hasta_y_cohorte(self):
+        with patch.object(server.ws_api, "descubrir_cursos",
+                          new=AsyncMock(return_value=[{"course_id": 1, "nombre": "Materia X"}])), \
+             patch.object(server.ws_api, "descubrir_comisiones",
+                          new=AsyncMock(return_value=[
+                              {"group_id": 9, "nombre": "Comisión 1", "tipo": "comision"},
+                              {"group_id": 10, "nombre": "R-Ciudad", "tipo": "regional"},
+                          ])):
+            r = correr(server.agregar_campus(
+                tenant_id="otra-facu2", nombre="Otra Facu 2", url="https://otra2.example",
+                moodle_user="u", moodle_pass="p"))
+        self.assertTrue(r["ok"])
+
+        aulas_cat = json.loads(
+            (Path(almacen.tenant_dir("otra-facu2")) / "aulas.json").read_text(encoding="utf-8"))
+        self.assertIn("vigente_hasta", aulas_cat)
+        self.assertTrue(aulas_cat["vigente_hasta"])
+        self.assertIn("cohorte", aulas_cat)
+
+        com_cat = json.loads(
+            (Path(almacen.tenant_dir("otra-facu2")) / "comisiones.json").read_text(encoding="utf-8"))
+        self.assertIn("vigente_hasta", com_cat)
+        comisiones = com_cat["materias"][0]["comisiones"]
+        # Sólo el grupo tipo "comision" quedó, el "regional" se filtró.
+        self.assertEqual(len(comisiones), 1)
+        self.assertEqual(comisiones[0]["group_id"], 9)
+        # `aulas()` (activo = "otra-facu2") no debería avisar que el catálogo venció.
+        correr(server.usar_campus("otra-facu2"))
+        with patch.object(server.ws_api, "descubrir_cursos",
+                          new=AsyncMock(return_value=[{"course_id": 1, "nombre": "Materia X"}])):
+            r_aulas = correr(server.aulas())
+        self.assertNotIn("venció", r_aulas.get("aviso", ""))
 
 
 class TestMigracionAutomaticaAlImportar(unittest.TestCase):
